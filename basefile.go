@@ -2,6 +2,7 @@ package basefs
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path"
 	"strings"
@@ -21,6 +22,9 @@ func fixerr(prefix string, err error) error {
 		return nil
 	}
 
+	if err == io.EOF {
+		return io.EOF
+	}
 	switch v := err.(type) {
 	case *os.PathError:
 		p := strings.Replace(v.Path, prefix, "", 0)

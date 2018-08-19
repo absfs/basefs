@@ -9,17 +9,10 @@ import (
 	"time"
 
 	"github.com/absfs/absfs"
-	"github.com/fatih/color"
 )
 
-var yellow = color.New(color.FgYellow).SprintFunc()
-var red = color.New(color.FgRed).SprintFunc()
-var green = color.New(color.FgGreen).SprintFunc()
-var blue = color.New(color.FgBlue).SprintFunc()
-var magenta = color.New(color.FgMagenta).SprintFunc()
-
 type FileSystem struct {
-	fs     absfs.FileSystem
+	fs     absfs.SymlinkFileSystem
 	cwd    string
 	prefix string
 }
@@ -27,7 +20,7 @@ type FileSystem struct {
 // NewFS creates a new FileSystem from a `absfs.FileSystem` compatible object
 // and a path. The path must be an absolute path and must already exist in the
 // fs provided otherwise an error is returned.
-func NewFS(fs absfs.FileSystem, dir string) (*FileSystem, error) {
+func NewFS(fs absfs.SymlinkFileSystem, dir string) (*FileSystem, error) {
 	if dir == "" {
 		return nil, os.ErrInvalid
 	}
@@ -245,174 +238,54 @@ func (f *FileSystem) path(name string) (string, error) {
 	return name, nil
 }
 
-/*
-func (f *FileSystem) Mkdir(name string, perm os.FileMode) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-	return f.f.Mkdir(path, perm)
-}
-
-func (f *FileSystem) MkdirAll(name string, perm os.FileMode) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-	return f.f.MkdirAll(path, perm)
-}
-
-func (f *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
-
-	ppath, err := f.path(name)
-	if err != nil {
-		return nil, err //errors.Wrap(err, "opening file")
-	}
-	if flag&os.O_CREATE != 0 && name == "/" {
-		return nil, &os.PathError{Op: "open", Path: "/", Err: errors.New("is a directory")}
-	}
-
-	file, err := f.f.OpenFile(path, flag, perm)
-	if err != nil {
-		patherr, ok := err.(*os.PathError)
-		if ok {
-
-			patherr.Path = name //  strings.Trim(patherr.Path, f.prefix)
-
-			return nil, patherr
-		}
-		return nil, err
-	}
-	return file, nil
-}
-
-func (f *FileSystem) Remove(name string) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-
-	return f.f.Remove(path)
-}
-
-func (f *FileSystem) RemoveAll(name string) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-
-	return f.f.RemoveAll(path)
-}
-
-func (f *FileSystem) Stat(name string) (os.FileInfo, error) {
+func (f *FileSystem) Lstat(name string) (os.FileInfo, error) {
 	ppath, err := f.path(name)
 	if err != nil {
 		return nil, err
 	}
 
-	return f.f.Stat(path)
+	info, err := f.fs.Lstat(ppath)
+	return info, fixerr(f.prefix, err)
 }
 
-//Chmod changes the mode of the named file to mode.
-func (f *FileSystem) Chmod(name string, mode os.FileMode) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-
-	return f.f.Chmod(path, mode)
-}
-
-//Chtimes changes the access and modification times of the named file
-func (f *FileSystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-
-	return f.f.Chtimes(path, atime, mtime)
-}
-
-//Chown changes the owner and group ids of the named file
-func (f *FileSystem) Chown(name string, uid, gid int) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-
-	return f.f.Chown(path, uid, gid)
-}
-
-func (f *FileSystem) Link(oldname, newname string) error {
-
-	linker, ok := f.f.(absfs.Linker)
-	if !ok {
-		return errors.New("underlying file system is not a linker")
-	}
-	oldpath, err := f.path(oldname)
-	if err != nil {
-		return err
-	}
-	newpath, err := f.path(oldname)
-	if err != nil {
-		return err
-	}
-
-	return linker.Link(oldpath, newpath)
-}
-
-// func (f *FileSystem) SameFile(fi1, fi2 os.FileInfo) bool {
-// 	linker, ok := f.f.(absfs.Linker)
-// 	if !ok {
-// 		return errors.New("underlying file system is not a linker")
-// 	}
-// 	return linker.SameFile(fi1, fi2)
-// }
+// ess
 
 func (f *FileSystem) Lchown(name string, uid, gid int) error {
-	linker, ok := f.f.(absfs.Linker)
-	if !ok {
-		return errors.New("underlying file system is not a linker")
-	}
-
 	ppath, err := f.path(name)
 	if err != nil {
 		return err
 	}
 
-	return linker.Lchown(path, uid, gid)
+	err = f.fs.Lchown(ppath, uid, gid)
+	return fixerr(f.prefix, err)
 }
 
 func (f *FileSystem) Readlink(name string) (string, error) {
-	linker, ok := f.f.(absfs.Linker)
-	if !ok {
-		return "", errors.New("underlying file system is not a linker")
-	}
-
 	ppath, err := f.path(name)
 	if err != nil {
 		return "", err
 	}
 
-	return linker.Readlink(path)
+	target, err := f.fs.Readlink(ppath)
+	if err != nil {
+		return "", err
+	}
+
+	target = strings.TrimPrefix(target, f.prefix)
+
+	return target, fixerr(f.prefix, err)
 }
 
 func (f *FileSystem) Symlink(oldname, newname string) error {
+	poldname, err := f.path(oldname)
+	if err != nil {
+		return err
+	}
+	pnewname, err := f.path(newname)
+	if err != nil {
+		return err
+	}
 
-	linker, ok := f.f.(absfs.Linker)
-	if !ok {
-		return errors.New("underlying file system is not a linker")
-	}
-	oldpath, err := f.path(oldname)
-	if err != nil {
-		return err
-	}
-	newpath, err := f.path(oldname)
-	if err != nil {
-		return err
-	}
-	return linker.Symlink(oldpath, newpath)
+	err = f.fs.Symlink(poldname, pnewname)
+	return fixerr(f.prefix, err)
 }
-
-// Seek(offset int64, whence int) (ret int64, err error)	os
-*/
