@@ -7,7 +7,7 @@ import (
 // Unwrap checks if `fs` is a `*basefs.FileSystem` and if so returns the
 // underlying `absfs.FileSystem`, otherwise it returns `fs`
 func Unwrap(fs absfs.FileSystem) absfs.FileSystem {
-	bfs, ok := fs.(*FileSystem)
+	bfs, ok := fs.(*SymlinkFileSystem)
 	if ok {
 		return bfs.fs
 	}
@@ -17,7 +17,7 @@ func Unwrap(fs absfs.FileSystem) absfs.FileSystem {
 // Prefix checks if `fs` is a `*basefs.FileSystem` and if so returns the prefix.
 // otherwise it returns an empty string
 func Prefix(fs absfs.FileSystem) string {
-	bfs, ok := fs.(*FileSystem)
+	bfs, ok := fs.(*SymlinkFileSystem)
 	if ok {
 		return bfs.prefix
 	}

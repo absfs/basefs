@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/absfs/absfs"
-	"github.com/absfs/fstools"
 
 	"github.com/absfs/basefs"
 	"github.com/absfs/fstesting"
@@ -272,13 +271,13 @@ func TestSymlinks(t *testing.T) {
 				t.Errorf("%d: Expected Lstat to return a link %s", i, lInfo.Mode())
 			}
 
-			sourceAbs, err := filepath.Abs(source)
-			if err != nil {
-				t.Error(err)
-			}
+			// sourceAbs, err := filepath.Abs(source)
+			// if err != nil {
+			// 	t.Error(err)
+			// }
 
-			t.Logf("%s\n", fstools.NewFileInfo(test.FS, info, sourceAbs))
-			t.Logf("%s\n", fstools.NewFileInfo(test.FS, lInfo, sourceAbs))
+			// t.Logf("%s\n", fstools.NewFileInfo(test.FS, info, sourceAbs))
+			// t.Logf("%s\n", fstools.NewFileInfo(test.FS, lInfo, sourceAbs))
 		}()
 
 	}
