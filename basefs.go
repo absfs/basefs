@@ -78,6 +78,22 @@ func (f *SymlinkFileSystem) Remove(name string) error {
 	return fixerr(f.prefix, err)
 }
 
+func (f *SymlinkFileSystem) Rename(oldname, newname string) error {
+	linkErr := os.LinkError{Op: "rename", Old: oldname, New: newname}
+	oldpath, err := f.path(oldname)
+	if err != nil {
+		linkErr.Err = err
+		return &linkErr
+	}
+	newpath, err := f.path(newname)
+	if err != nil {
+		linkErr.Err = err
+		return &linkErr
+	}
+	err = f.fs.Rename(oldpath, newpath)
+	return fixerr(f.prefix, err)
+}
+
 // Stat returns the FileInfo structure describing file. If there is an error,
 // it will be of type *PathError.
 func (f *SymlinkFileSystem) Stat(name string) (os.FileInfo, error) {
@@ -357,6 +373,22 @@ func (f *FileSystem) Remove(name string) error {
 	return fixerr(f.prefix, err)
 }
 
+func (f *FileSystem) Rename(oldname, newname string) error {
+	linkErr := os.LinkError{Op: "rename", Old: oldname, New: newname}
+	oldpath, err := f.path(oldname)
+	if err != nil {
+		linkErr.Err = err
+		return &linkErr
+	}
+	newpath, err := f.path(newname)
+	if err != nil {
+		linkErr.Err = err
+		return &linkErr
+	}
+	err = f.fs.Rename(oldpath, newpath)
+	return fixerr(f.prefix, err)
+}
+
 // Stat returns the FileInfo structure describing file. If there is an error,
 // it will be of type *PathError.
 func (f *FileSystem) Stat(name string) (os.FileInfo, error) {
@@ -515,4 +547,54 @@ func (f *FileSystem) path(name string) (string, error) {
 		return "", &os.PathError{Op: "open", Path: name, Err: errors.New("no such file or directory")}
 	}
 	return name, nil
+}
+
+// type WalkFunc func(string, os.FileInfo, error) error
+// type FastWalkFunc func(string, os.FileMode) error
+
+type walker interface {
+	Walk(string, func(string, os.FileInfo, error) error) error
+}
+
+type fastwalker interface {
+	FastWalk(string, func(string, os.FileMode) error) error
+}
+
+var errNoWalk = errors.New("walk function not supported by underlying filesystem")
+var errNoFastWalk = errors.New("fastwalk function not supported by underlying filesystem")
+
+func (fs *SymlinkFileSystem) Walk(name string, fn filepath.WalkFunc) error {
+	ppath, err := fs.path(name)
+	if err != nil {
+		return err
+	}
+	wfs, ok := fs.fs.(walker)
+	if !ok {
+		return errNoWalk
+	}
+	return wfs.Walk(ppath, func(path string, info os.FileInfo, err error) error {
+		p := strings.TrimPrefix(path, fs.prefix)
+		if p == "" {
+			p = "/"
+		}
+		return fn(p, info, err)
+	})
+}
+
+func (fs *SymlinkFileSystem) FastWalk(name string, fn absfs.FastWalkFunc) error {
+	ppath, err := fs.path(name)
+	if err != nil {
+		return err
+	}
+	wfs, ok := fs.fs.(fastwalker)
+	if !ok {
+		return errNoFastWalk
+	}
+	return wfs.FastWalk(ppath, func(path string, mode os.FileMode) error {
+		p := strings.TrimPrefix(path, fs.prefix)
+		if p == "" {
+			p = "/"
+		}
+		return fn(p, mode)
+	})
 }

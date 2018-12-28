@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/absfs/absfs"
@@ -15,7 +16,119 @@ import (
 	"github.com/absfs/basefs"
 	"github.com/absfs/fstesting"
 	"github.com/absfs/osfs"
+	"github.com/absfs/osfs/fastwalk"
 )
+
+func TestWalk(t *testing.T) {
+
+	ofs, err := osfs.NewFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	testpath := ".."
+	abs, err := filepath.Abs(testpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testpath = abs
+
+	fs, err := basefs.NewFS(ofs, testpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("Walk", func(t *testing.T) {
+		list := make(map[string]bool)
+		count := 0
+		err = filepath.Walk(testpath, func(path string, info os.FileInfo, err error) error {
+			p := strings.TrimPrefix(path, testpath)
+			if p == "" {
+				p = "/"
+			}
+			list[p] = true
+			count++
+			return nil
+		})
+		if err != nil {
+			t.Error(err)
+		}
+
+		count2 := 0
+		err = fs.Walk("/", func(path string, info os.FileInfo, err error) error {
+			if !list[path] {
+				return fmt.Errorf("file not found %q", path)
+			}
+			delete(list, path)
+			count2++
+			return nil
+		})
+		if err != nil {
+			t.Error(err)
+		}
+		if count < 10 || count != count2 {
+			t.Errorf("incorrect file count: %d, %d", count, count2)
+		}
+		if len(list) > 0 {
+			i := 0
+			for k := range list {
+				i++
+				if i >= 10 {
+					break
+				}
+				t.Errorf("path not removed %q", k)
+			}
+		}
+	})
+
+	t.Run("FastWalk", func(t *testing.T) {
+		list := make(map[string]bool)
+		count := 0
+		x := sync.Mutex{}
+		err = fastwalk.Walk(testpath, func(path string, mode os.FileMode) error {
+			p := strings.TrimPrefix(path, testpath)
+			if p == "" {
+				p = "/"
+			}
+			x.Lock()
+			list[p] = true
+			count++
+			x.Unlock()
+			return nil
+		})
+		if err != nil {
+			t.Error(err)
+		}
+
+		count2 := 0
+		err = fs.FastWalk("/", func(path string, mode os.FileMode) error {
+			x.Lock()
+			if !list[path] {
+				return fmt.Errorf("file not found %q", path)
+			}
+			delete(list, path)
+			count2++
+			x.Unlock()
+			return nil
+		})
+		if err != nil {
+			t.Error(err)
+		}
+		if count < 10 || count != count2 {
+			t.Errorf("incorrect file count: %d, %d", count, count2)
+		}
+		if len(list) > 0 {
+			i := 0
+			for k := range list {
+				i++
+				if i >= 10 {
+					break
+				}
+				t.Errorf("path not removed %q", k)
+			}
+		}
+	})
+}
 
 func TestOpenFile(t *testing.T) {
 	// var err error
