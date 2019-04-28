@@ -19,6 +19,29 @@ import (
 	"github.com/absfs/osfs/fastwalk"
 )
 
+func TestAbsfs(t *testing.T) {
+	ofs, err := osfs.NewFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testpath := os.TempDir()
+	abs, err := filepath.Abs(testpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testpath = abs
+
+	bfs, err := basefs.NewFS(ofs, testpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var fs absfs.SymlinkFileSystem
+	fs = bfs
+	_ = fs
+}
+
 func TestWalk(t *testing.T) {
 
 	ofs, err := osfs.NewFS()

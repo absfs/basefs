@@ -549,9 +549,6 @@ func (f *FileSystem) path(name string) (string, error) {
 	return name, nil
 }
 
-// type WalkFunc func(string, os.FileInfo, error) error
-// type FastWalkFunc func(string, os.FileMode) error
-
 type walker interface {
 	Walk(string, func(string, os.FileInfo, error) error) error
 }
