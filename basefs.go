@@ -11,13 +11,64 @@ import (
 	"github.com/absfs/absfs"
 )
 
-type SymlinkFileSystem struct {
-	fs     absfs.SymlinkFileSystem
+// baseFS contains the common implementation shared by FileSystem and SymlinkFileSystem
+type baseFS struct {
 	cwd    string
 	prefix string
 }
 
-// NewFS creates a new FileSystem from a `absfs.FileSystem` compatible object
+// Common methods shared by both FileSystem and SymlinkFileSystem
+
+func (b *baseFS) Separator() uint8 {
+	return '/'
+}
+
+func (b *baseFS) ListSeparator() uint8 {
+	return ':'
+}
+
+func (b *baseFS) Chdir(dir string) error {
+	dir = path.Clean(dir)
+	if path.IsAbs(dir) {
+		b.cwd = dir
+		return nil
+	}
+
+	b.cwd = path.Join(b.cwd, dir)
+	return nil
+}
+
+func (b *baseFS) Getwd() (dir string, err error) {
+	return b.cwd, nil
+}
+
+func (b *baseFS) path(name string) (string, error) {
+	if name == "" {
+		name = b.cwd
+	}
+
+	if name == "/" {
+		return b.prefix, nil
+	}
+
+	if !path.IsAbs(name) {
+		name = path.Clean(name)
+	}
+	name = filepath.Join(b.prefix, name)
+
+	// We mustn't let any trickery escape the prefix path.
+	if !strings.HasPrefix(name, b.prefix) {
+		return "", &os.PathError{Op: "open", Path: name, Err: errors.New("no such file or directory")}
+	}
+	return name, nil
+}
+
+type SymlinkFileSystem struct {
+	baseFS
+	fs absfs.SymlinkFileSystem
+}
+
+// NewFS creates a new SymlinkFileSystem from a `absfs.SymlinkFileSystem` compatible object
 // and a path. The path must be an absolute path and must already exist in the
 // fs provided otherwise an error is returned.
 func NewFS(fs absfs.SymlinkFileSystem, dir string) (*SymlinkFileSystem, error) {
@@ -36,7 +87,10 @@ func NewFS(fs absfs.SymlinkFileSystem, dir string) (*SymlinkFileSystem, error) {
 		return nil, errors.New("not a directory")
 	}
 
-	return &SymlinkFileSystem{fs, "/", dir}, nil
+	return &SymlinkFileSystem{
+		baseFS: baseFS{cwd: "/", prefix: dir},
+		fs:     fs,
+	}, nil
 }
 
 // OpenFile opens a file using the given flags and the given mode.
@@ -110,7 +164,7 @@ func (f *SymlinkFileSystem) Stat(name string) (os.FileInfo, error) {
 	return &fileinfo{info, path.Base(name)}, nil
 }
 
-//Chmod changes the mode of the named file to mode.
+// Chmod changes the mode of the named file to mode.
 func (f *SymlinkFileSystem) Chmod(name string, mode os.FileMode) error {
 	ppath, err := f.path(name)
 	if err != nil {
@@ -121,7 +175,7 @@ func (f *SymlinkFileSystem) Chmod(name string, mode os.FileMode) error {
 	return fixerr(f.prefix, err)
 }
 
-//Chtimes changes the access and modification times of the named file
+// Chtimes changes the access and modification times of the named file
 func (f *SymlinkFileSystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	ppath, err := f.path(name)
 	if err != nil {
@@ -131,7 +185,7 @@ func (f *SymlinkFileSystem) Chtimes(name string, atime time.Time, mtime time.Tim
 	return fixerr(f.prefix, err)
 }
 
-//Chown changes the owner and group ids of the named file
+// Chown changes the owner and group ids of the named file
 func (f *SymlinkFileSystem) Chown(name string, uid, gid int) error {
 	ppath, err := f.path(name)
 	if err != nil {
@@ -140,29 +194,6 @@ func (f *SymlinkFileSystem) Chown(name string, uid, gid int) error {
 
 	err = f.fs.Chown(ppath, uid, gid)
 	return fixerr(f.prefix, err)
-}
-
-func (f *SymlinkFileSystem) Separator() uint8 {
-	return '/'
-}
-
-func (f *SymlinkFileSystem) ListSeparator() uint8 {
-	return ':'
-}
-
-func (f *SymlinkFileSystem) Chdir(dir string) error {
-	dir = path.Clean(dir)
-	if path.IsAbs(dir) {
-		f.cwd = dir
-		return nil
-	}
-
-	f.cwd = path.Join(f.cwd, dir)
-	return nil
-}
-
-func (f *SymlinkFileSystem) Getwd() (dir string, err error) {
-	return f.cwd, nil
 }
 
 func (f *SymlinkFileSystem) TempDir() string {
@@ -232,28 +263,6 @@ func (f *SymlinkFileSystem) Truncate(name string, size int64) error {
 	return f.fs.Truncate(ppath, size)
 }
 
-func (f *SymlinkFileSystem) path(name string) (string, error) {
-	if name == "" {
-		name = f.cwd
-		//return "", &os.PathError{Op: "open", Path: "", Err: errors.New("no such file or directory")}
-	}
-
-	if name == "/" {
-		return f.prefix, nil
-	}
-
-	if !path.IsAbs(name) {
-		name = path.Clean(name)
-	}
-	name = filepath.Join(f.prefix, name)
-
-	// We mustn't let any trickery escape the prefix path.
-	if !strings.HasPrefix(name, f.prefix) {
-		return "", &os.PathError{Op: "open", Path: name, Err: errors.New("no such file or directory")}
-	}
-	return name, nil
-}
-
 func (f *SymlinkFileSystem) Lstat(name string) (os.FileInfo, error) {
 	ppath, err := f.path(name)
 	if err != nil {
@@ -307,9 +316,8 @@ func (f *SymlinkFileSystem) Symlink(oldname, newname string) error {
 }
 
 type FileSystem struct {
-	fs     absfs.FileSystem
-	cwd    string
-	prefix string
+	baseFS
+	fs absfs.FileSystem
 }
 
 // NewFileSystem creates a new FileSystem from a `absfs.FileSystem` compatible object
@@ -331,7 +339,10 @@ func NewFileSystem(fs absfs.FileSystem, dir string) (*FileSystem, error) {
 		return nil, errors.New("not a directory")
 	}
 
-	return &FileSystem{fs, "/", dir}, nil
+	return &FileSystem{
+		baseFS: baseFS{cwd: "/", prefix: dir},
+		fs:     fs,
+	}, nil
 }
 
 // OpenFile opens a file using the given flags and the given mode.
@@ -405,7 +416,7 @@ func (f *FileSystem) Stat(name string) (os.FileInfo, error) {
 	return &fileinfo{info, path.Base(name)}, nil
 }
 
-//Chmod changes the mode of the named file to mode.
+// Chmod changes the mode of the named file to mode.
 func (f *FileSystem) Chmod(name string, mode os.FileMode) error {
 	ppath, err := f.path(name)
 	if err != nil {
@@ -416,7 +427,7 @@ func (f *FileSystem) Chmod(name string, mode os.FileMode) error {
 	return fixerr(f.prefix, err)
 }
 
-//Chtimes changes the access and modification times of the named file
+// Chtimes changes the access and modification times of the named file
 func (f *FileSystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	ppath, err := f.path(name)
 	if err != nil {
@@ -426,7 +437,7 @@ func (f *FileSystem) Chtimes(name string, atime time.Time, mtime time.Time) erro
 	return fixerr(f.prefix, err)
 }
 
-//Chown changes the owner and group ids of the named file
+// Chown changes the owner and group ids of the named file
 func (f *FileSystem) Chown(name string, uid, gid int) error {
 	ppath, err := f.path(name)
 	if err != nil {
@@ -435,29 +446,6 @@ func (f *FileSystem) Chown(name string, uid, gid int) error {
 
 	err = f.fs.Chown(ppath, uid, gid)
 	return fixerr(f.prefix, err)
-}
-
-func (f *FileSystem) Separator() uint8 {
-	return '/'
-}
-
-func (f *FileSystem) ListSeparator() uint8 {
-	return ':'
-}
-
-func (f *FileSystem) Chdir(dir string) error {
-	dir = path.Clean(dir)
-	if path.IsAbs(dir) {
-		f.cwd = dir
-		return nil
-	}
-
-	f.cwd = path.Join(f.cwd, dir)
-	return nil
-}
-
-func (f *FileSystem) Getwd() (dir string, err error) {
-	return f.cwd, nil
 }
 
 func (f *FileSystem) TempDir() string {
@@ -525,28 +513,6 @@ func (f *FileSystem) Truncate(name string, size int64) error {
 	}
 
 	return f.fs.Truncate(ppath, size)
-}
-
-func (f *FileSystem) path(name string) (string, error) {
-	if name == "" {
-		name = f.cwd
-		//return "", &os.PathError{Op: "open", Path: "", Err: errors.New("no such file or directory")}
-	}
-
-	if name == "/" {
-		return f.prefix, nil
-	}
-
-	if !path.IsAbs(name) {
-		name = path.Clean(name)
-	}
-	name = filepath.Join(f.prefix, name)
-
-	// We mustn't let any trickery escape the prefix path.
-	if !strings.HasPrefix(name, f.prefix) {
-		return "", &os.PathError{Op: "open", Path: name, Err: errors.New("no such file or directory")}
-	}
-	return name, nil
 }
 
 type walker interface {
