@@ -88,11 +88,7 @@ func (f *File) Sync() error {
 }
 
 func (f *File) Readdir(n int) (dirs []os.FileInfo, err error) {
-	// fmt.Printf("absfs/basefs Readdir %d\n", n)
 	dirs, err = f.f.Readdir(n)
-	// if err != nil {
-	// 	fmt.Printf("absfs/basefs Readdir Error %s\n", err)
-	// }
 	return dirs, fixerr(f.prefix, err)
 }
 
