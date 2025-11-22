@@ -76,7 +76,7 @@ func NewFS(fs absfs.SymlinkFileSystem, dir string) (*SymlinkFileSystem, error) {
 		return nil, os.ErrInvalid
 	}
 
-	if !path.IsAbs(dir) {
+	if !filepath.IsAbs(dir) {
 		return nil, errors.New("not an absolute path")
 	}
 	info, err := fs.Stat(dir)
@@ -328,7 +328,7 @@ func NewFileSystem(fs absfs.FileSystem, dir string) (*FileSystem, error) {
 		return nil, os.ErrInvalid
 	}
 
-	if !path.IsAbs(dir) {
+	if !filepath.IsAbs(dir) {
 		return nil, errors.New("not an absolute path")
 	}
 	info, err := fs.Stat(dir)
