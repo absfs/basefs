@@ -160,17 +160,30 @@ func ExampleSymlinkFileSystem_Walk() {
 		log.Fatal(err)
 	}
 
-	tmpdir := os.TempDir()
+	// Create an isolated temp directory for this test
+	tmpdir, err := os.MkdirTemp("", "basefs-walk-example-")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(tmpdir)
+
 	bfs, err := basefs.NewFS(ofs, tmpdir)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Create some test files
-	bfs.Create("/walk-test-1.txt")
-	bfs.Create("/walk-test-2.txt")
-	defer bfs.Remove("/walk-test-1.txt")
-	defer bfs.Remove("/walk-test-2.txt")
+	// Create some test files, ensuring they are properly closed
+	f1, err := bfs.Create("/walk-test-1.txt")
+	if err != nil {
+		log.Fatal(err)
+	}
+	f1.Close()
+
+	f2, err := bfs.Create("/walk-test-2.txt")
+	if err != nil {
+		log.Fatal(err)
+	}
+	f2.Close()
 
 	// Walk the filesystem
 	count := 0
