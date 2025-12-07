@@ -296,7 +296,14 @@ func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
 		return "", err
 	}
 
-	target = strings.TrimPrefix(target, f.prefix)
+	// If the target is within our prefix, convert it to a virtual path
+	if strings.HasPrefix(target, f.prefix) {
+		target = strings.TrimPrefix(target, f.prefix)
+		// Ensure the result is an absolute path
+		if target == "" || !strings.HasPrefix(target, "/") {
+			target = "/" + target
+		}
+	}
 
 	return target, fixerr(f.prefix, err)
 }
