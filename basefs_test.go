@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -166,9 +167,15 @@ func TestBaseFSSuite(t *testing.T) {
 		t.Fatalf("basefs TempDir() returned empty path")
 	}
 
+	features := fstesting.DefaultFeatures()
+	// Windows doesn't support Unix-style permissions
+	if runtime.GOOS == "windows" {
+		features.Permissions = false
+	}
+
 	suite := &fstesting.Suite{
 		FS:       bfs,
-		Features: fstesting.DefaultFeatures(),
+		Features: features,
 	}
 
 	suite.Run(t)
