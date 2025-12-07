@@ -1,4 +1,10 @@
 # basefs - Base File System
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/absfs/basefs.svg)](https://pkg.go.dev/github.com/absfs/basefs)
+[![Go Report Card](https://goreportcard.com/badge/github.com/absfs/basefs)](https://goreportcard.com/report/github.com/absfs/basefs)
+[![CI](https://github.com/absfs/basefs/actions/workflows/ci.yml/badge.svg)](https://github.com/absfs/basefs/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 The `basefs` package implements the `absfs.FileSystem` interface by constraining a `absfs.FileSystem` to a specific subdirectory. A basefs filesystem will essentially be re-rooted to the provided subdirectory and no path navigation will allow access to paths outside of the subdirectory. All paths the are passed to the underlying filesystem are absolute paths constructed by the basefs to avoid ambiguity. After constructing the correct path basefs calls the underlying Filesystem methods normally. `basefs` will also edit any errors returned to reflect the path as it would appear if the prefix was removed.
 
 The `basefs` package also provides `Prefix` and `Unwrap` functions for debugging purposes.
