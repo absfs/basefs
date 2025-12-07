@@ -208,8 +208,12 @@ func ExampleSymlinkFileSystem_Walk() {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() && len(path) > 10 && path[:10] == "/walk-test" {
-			count++
+		// Count files that start with "walk-test" in their basename
+		if !info.IsDir() {
+			name := info.Name()
+			if len(name) >= 9 && name[:9] == "walk-test" {
+				count++
+			}
 		}
 		return nil
 	})
