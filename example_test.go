@@ -18,14 +18,17 @@ func ExampleNewFS() {
 		log.Fatal(err)
 	}
 
-	// Create a basefs constrained to /tmp directory
-	bfs, err := basefs.NewFS(ofs, "/tmp")
+	// Get the system temp directory (works cross-platform)
+	tmpdir := os.TempDir()
+
+	// Create a basefs constrained to temp directory
+	bfs, err := basefs.NewFS(ofs, tmpdir)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// All operations are now relative to /tmp
-	// This creates /tmp/example.txt
+	// All operations are now relative to the temp directory
+	// This creates a file in the temp directory
 	f, err := bfs.Create("/example.txt")
 	if err != nil {
 		log.Fatal(err)
@@ -39,8 +42,8 @@ func ExampleNewFS() {
 		log.Fatal(err)
 	}
 
-	fmt.Println("File created successfully within /tmp")
-	// Output: File created successfully within /tmp
+	fmt.Println("File created successfully")
+	// Output: File created successfully
 }
 
 // ExampleNewFileSystem demonstrates the non-symlink filesystem interface.
@@ -51,8 +54,11 @@ func ExampleNewFileSystem() {
 		log.Fatal(err)
 	}
 
-	// Create a basefs constrained to /tmp
-	bfs, err := basefs.NewFileSystem(ofs, "/tmp")
+	// Get the system temp directory (works cross-platform)
+	tmpdir := os.TempDir()
+
+	// Create a basefs constrained to temp directory
+	bfs, err := basefs.NewFileSystem(ofs, tmpdir)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -122,7 +128,8 @@ func ExampleUnwrap() {
 		log.Fatal(err)
 	}
 
-	bfs, err := basefs.NewFS(ofs, "/tmp")
+	tmpdir := os.TempDir()
+	bfs, err := basefs.NewFS(ofs, tmpdir)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -141,7 +148,8 @@ func ExamplePrefix() {
 		log.Fatal(err)
 	}
 
-	bfs, err := basefs.NewFS(ofs, "/tmp")
+	tmpdir := os.TempDir()
+	bfs, err := basefs.NewFS(ofs, tmpdir)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -149,8 +157,11 @@ func ExamplePrefix() {
 	// Get the prefix (base directory)
 	prefix := basefs.Prefix(bfs)
 
-	fmt.Printf("Base directory: %s\n", prefix)
-	// Output: Base directory: /tmp
+	// Verify the prefix matches what we set
+	if prefix == tmpdir {
+		fmt.Println("Prefix matches temp directory")
+	}
+	// Output: Prefix matches temp directory
 }
 
 // ExampleSymlinkFileSystem_Walk demonstrates directory traversal using Walk.
