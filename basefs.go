@@ -303,6 +303,8 @@ func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
 		if target == "" || !strings.HasPrefix(target, "/") {
 			target = "/" + target
 		}
+		// Convert OS path separators to forward slashes for virtual paths
+		target = filepath.ToSlash(target)
 	}
 
 	return target, fixerr(f.prefix, err)
