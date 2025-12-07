@@ -188,10 +188,16 @@ func ExampleSymlinkFileSystem_Walk() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if err := f1.Sync(); err != nil {
+		log.Fatal(err)
+	}
 	f1.Close()
 
 	f2, err := bfs.Create("/walk-test-2.txt")
 	if err != nil {
+		log.Fatal(err)
+	}
+	if err := f2.Sync(); err != nil {
 		log.Fatal(err)
 	}
 	f2.Close()
