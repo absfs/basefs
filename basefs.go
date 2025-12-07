@@ -299,12 +299,13 @@ func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
 	// If the target is within our prefix, convert it to a virtual path
 	if strings.HasPrefix(target, f.prefix) {
 		target = strings.TrimPrefix(target, f.prefix)
-		// Ensure the result is an absolute path
+		// Convert OS path separators to forward slashes for virtual paths
+		target = filepath.ToSlash(target)
+		// Ensure the result is an absolute path and clean it
 		if target == "" || !strings.HasPrefix(target, "/") {
 			target = "/" + target
 		}
-		// Convert OS path separators to forward slashes for virtual paths
-		target = filepath.ToSlash(target)
+		target = path.Clean(target)
 	}
 
 	return target, fixerr(f.prefix, err)
