@@ -54,7 +54,9 @@ func (b *baseFS) path(name string) (string, error) {
 	if !path.IsAbs(name) {
 		name = path.Clean(name)
 	}
-	name = filepath.Join(b.prefix, name)
+	// Use path.Join for Unix-style virtual paths, then convert to OS-native
+	// for the underlying filesystem operations
+	name = path.Join(b.prefix, name)
 
 	// We mustn't let any trickery escape the prefix path.
 	if !strings.HasPrefix(name, b.prefix) {
@@ -69,14 +71,14 @@ type SymlinkFileSystem struct {
 }
 
 // NewFS creates a new SymlinkFileSystem from a `absfs.SymlinkFileSystem` compatible object
-// and a path. The path must be an absolute path and must already exist in the
-// fs provided otherwise an error is returned.
+// and a path. The path must be an absolute path (Unix-style, starting with /)
+// and must already exist in the fs provided otherwise an error is returned.
 func NewFS(fs absfs.SymlinkFileSystem, dir string) (*SymlinkFileSystem, error) {
 	if dir == "" {
 		return nil, os.ErrInvalid
 	}
 
-	if !filepath.IsAbs(dir) {
+	if !path.IsAbs(dir) {
 		return nil, errors.New("not an absolute path")
 	}
 	info, err := fs.Stat(dir)
@@ -331,14 +333,14 @@ type FileSystem struct {
 }
 
 // NewFileSystem creates a new FileSystem from a `absfs.FileSystem` compatible object
-// and a path. The path must be an absolute path and must already exist in the
-// fs provided otherwise an error is returned.
+// and a path. The path must be an absolute path (Unix-style, starting with /)
+// and must already exist in the fs provided otherwise an error is returned.
 func NewFileSystem(fs absfs.FileSystem, dir string) (*FileSystem, error) {
 	if dir == "" {
 		return nil, os.ErrInvalid
 	}
 
-	if !filepath.IsAbs(dir) {
+	if !path.IsAbs(dir) {
 		return nil, errors.New("not an absolute path")
 	}
 	info, err := fs.Stat(dir)
