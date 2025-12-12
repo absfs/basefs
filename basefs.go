@@ -2,6 +2,7 @@ package basefs
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -18,14 +19,6 @@ type baseFS struct {
 }
 
 // Common methods shared by both FileSystem and SymlinkFileSystem
-
-func (b *baseFS) Separator() uint8 {
-	return '/'
-}
-
-func (b *baseFS) ListSeparator() uint8 {
-	return ':'
-}
 
 func (b *baseFS) Chdir(dir string) error {
 	dir = path.Clean(dir)
@@ -78,7 +71,7 @@ func NewFS(fs absfs.SymlinkFileSystem, dir string) (*SymlinkFileSystem, error) {
 		return nil, os.ErrInvalid
 	}
 
-	if !path.IsAbs(dir) {
+	if !filepath.IsAbs(dir) {
 		return nil, errors.New("not an absolute path")
 	}
 	info, err := fs.Stat(dir)
@@ -295,7 +288,13 @@ func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
 
 	target, err := f.fs.Readlink(ppath)
 	if err != nil {
-		return "", err
+		return "", fixerr(f.prefix, err)
+	}
+
+	// If the target is a relative path, return it as-is
+	// (relative symlinks are relative to the link location, not the basefs root)
+	if !path.IsAbs(target) && !filepath.IsAbs(target) {
+		return target, nil
 	}
 
 	// If the target is within our prefix, convert it to a virtual path
@@ -310,21 +309,65 @@ func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
 		target = path.Clean(target)
 	}
 
-	return target, fixerr(f.prefix, err)
+	return target, nil
 }
 
 func (f *SymlinkFileSystem) Symlink(oldname, newname string) error {
-	poldname, err := f.path(oldname)
-	if err != nil {
-		return err
-	}
+	// Only translate newname (the link path) through basefs prefix
+	// oldname (the target) should be:
+	// - Kept as-is if relative (symlink target is relative to link location)
+	// - Translated if absolute (symlink target points to absolute path in virtual fs)
 	pnewname, err := f.path(newname)
 	if err != nil {
 		return err
 	}
 
-	err = f.fs.Symlink(poldname, pnewname)
+	var target string
+	if path.IsAbs(oldname) {
+		// Absolute virtual path - translate to real path
+		target, err = f.path(oldname)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Relative path - keep as-is, symlink is relative to link location
+		target = oldname
+	}
+
+	err = f.fs.Symlink(target, pnewname)
 	return fixerr(f.prefix, err)
+}
+
+// ReadDir reads the named directory and returns a list of directory entries sorted by filename.
+func (f *SymlinkFileSystem) ReadDir(name string) ([]fs.DirEntry, error) {
+	ppath, err := f.path(name)
+	if err != nil {
+		return nil, err
+	}
+
+	entries, err := f.fs.ReadDir(ppath)
+	return entries, fixerr(f.prefix, err)
+}
+
+// ReadFile reads the named file and returns its contents.
+func (f *SymlinkFileSystem) ReadFile(name string) ([]byte, error) {
+	ppath, err := f.path(name)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := f.fs.ReadFile(ppath)
+	return data, fixerr(f.prefix, err)
+}
+
+// Sub returns an fs.FS corresponding to the subtree rooted at dir.
+func (f *SymlinkFileSystem) Sub(dir string) (fs.FS, error) {
+	ppath, err := f.path(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	return absfs.FilerToFS(f.fs, ppath)
 }
 
 type FileSystem struct {
@@ -340,7 +383,7 @@ func NewFileSystem(fs absfs.FileSystem, dir string) (*FileSystem, error) {
 		return nil, os.ErrInvalid
 	}
 
-	if !path.IsAbs(dir) {
+	if !filepath.IsAbs(dir) {
 		return nil, errors.New("not an absolute path")
 	}
 	info, err := fs.Stat(dir)
@@ -527,49 +570,35 @@ func (f *FileSystem) Truncate(name string, size int64) error {
 	return f.fs.Truncate(ppath, size)
 }
 
-type walker interface {
-	Walk(string, func(string, os.FileInfo, error) error) error
-}
-
-type fastwalker interface {
-	FastWalk(string, func(string, os.FileMode) error) error
-}
-
-var errNoWalk = errors.New("walk function not supported by underlying filesystem")
-var errNoFastWalk = errors.New("fastwalk function not supported by underlying filesystem")
-
-func (fs *SymlinkFileSystem) Walk(name string, fn filepath.WalkFunc) error {
-	ppath, err := fs.path(name)
+// ReadDir reads the named directory and returns a list of directory entries sorted by filename.
+func (f *FileSystem) ReadDir(name string) ([]fs.DirEntry, error) {
+	ppath, err := f.path(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	wfs, ok := fs.fs.(walker)
-	if !ok {
-		return errNoWalk
-	}
-	return wfs.Walk(ppath, func(path string, info os.FileInfo, err error) error {
-		p := strings.TrimPrefix(path, fs.prefix)
-		if p == "" {
-			p = "/"
-		}
-		return fn(p, info, err)
-	})
+
+	entries, err := f.fs.ReadDir(ppath)
+	return entries, fixerr(f.prefix, err)
 }
 
-func (fs *SymlinkFileSystem) FastWalk(name string, fn absfs.FastWalkFunc) error {
-	ppath, err := fs.path(name)
+// ReadFile reads the named file and returns its contents.
+func (f *FileSystem) ReadFile(name string) ([]byte, error) {
+	ppath, err := f.path(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	wfs, ok := fs.fs.(fastwalker)
-	if !ok {
-		return errNoFastWalk
-	}
-	return wfs.FastWalk(ppath, func(path string, mode os.FileMode) error {
-		p := strings.TrimPrefix(path, fs.prefix)
-		if p == "" {
-			p = "/"
-		}
-		return fn(p, mode)
-	})
+
+	data, err := f.fs.ReadFile(ppath)
+	return data, fixerr(f.prefix, err)
 }
+
+// Sub returns an fs.FS corresponding to the subtree rooted at dir.
+func (f *FileSystem) Sub(dir string) (fs.FS, error) {
+	ppath, err := f.path(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	return absfs.FilerToFS(f.fs, ppath)
+}
+

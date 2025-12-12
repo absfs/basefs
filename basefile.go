@@ -3,6 +3,7 @@ package basefs
 import (
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"strings"
@@ -95,6 +96,11 @@ func (f *File) Readdir(n int) (dirs []os.FileInfo, err error) {
 func (f *File) Readdirnames(n int) (names []string, err error) {
 	names, err = f.f.Readdirnames(n)
 	return names, fixerr(f.prefix, err)
+}
+
+func (f *File) ReadDir(n int) ([]fs.DirEntry, error) {
+	entries, err := f.f.ReadDir(n)
+	return entries, fixerr(f.prefix, err)
 }
 
 func (f *File) Truncate(size int64) error {

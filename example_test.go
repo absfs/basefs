@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/absfs/basefs"
+	"github.com/absfs/fstools"
 	"github.com/absfs/osfs"
 )
 
@@ -164,8 +165,8 @@ func ExamplePrefix() {
 	// Output: Prefix matches temp directory
 }
 
-// ExampleSymlinkFileSystem_Walk demonstrates directory traversal using Walk.
-func ExampleSymlinkFileSystem_Walk() {
+// Example_directoryTraversal demonstrates directory traversal using fstools.Walk.
+func Example_directoryTraversal() {
 	ofs, err := osfs.NewFS()
 	if err != nil {
 		log.Fatal(err)
@@ -204,7 +205,7 @@ func ExampleSymlinkFileSystem_Walk() {
 
 	// Walk the filesystem
 	count := 0
-	err = bfs.Walk("/", func(path string, info os.FileInfo, err error) error {
+	err = fstools.Walk(bfs, "/", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
