@@ -66,6 +66,9 @@ func TestWalk(t *testing.T) {
 			if p == "" {
 				p = "/"
 			}
+			// Normalize to forward slashes for comparison with fstools.Walk
+			// which uses Unix-style paths (the absfs convention)
+			p = filepath.ToSlash(p)
 			list[p] = true
 			count++
 			return nil
