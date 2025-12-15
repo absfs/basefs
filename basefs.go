@@ -6,11 +6,32 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/absfs/absfs"
 )
+
+// normalizeForComparison converts a path to a canonical format for comparison.
+// This handles the case where paths may be in different formats (e.g., "C:\Users\..."
+// vs "/c/Users/..." on Windows when using osfs as the underlying filesystem).
+func normalizeForComparison(p string) string {
+	// Convert to forward slashes
+	p = filepath.ToSlash(p)
+
+	// On Windows, also handle drive letter normalization: C:/... → /c/...
+	if runtime.GOOS == "windows" && len(p) >= 2 && p[1] == ':' && unicode.IsLetter(rune(p[0])) {
+		drive := strings.ToLower(string(p[0]))
+		rest := ""
+		if len(p) > 2 {
+			rest = p[2:]
+		}
+		p = "/" + drive + rest
+	}
+	return p
+}
 
 // baseFS contains the common implementation shared by FileSystem and SymlinkFileSystem
 type baseFS struct {
@@ -297,11 +318,15 @@ func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
 		return target, nil
 	}
 
+	// Normalize both paths to a common format for comparison.
+	// This handles cases where the underlying fs returns paths in different formats
+	// (e.g., osfs returns "/c/Users/..." on Windows, but prefix may be "C:\Users\...")
+	normalizedTarget := normalizeForComparison(target)
+	normalizedPrefix := normalizeForComparison(f.prefix)
+
 	// If the target is within our prefix, convert it to a virtual path
-	if strings.HasPrefix(target, f.prefix) {
-		target = strings.TrimPrefix(target, f.prefix)
-		// Convert OS path separators to forward slashes for virtual paths
-		target = filepath.ToSlash(target)
+	if strings.HasPrefix(normalizedTarget, normalizedPrefix) {
+		target = strings.TrimPrefix(normalizedTarget, normalizedPrefix)
 		// Ensure the result is an absolute path and clean it
 		if target == "" || !strings.HasPrefix(target, "/") {
 			target = "/" + target
