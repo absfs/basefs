@@ -11,7 +11,8 @@ import (
 
 // TestBaseFSSuite runs the standard fstesting suite against basefs wrapping osfs.
 func TestBaseFSSuite(t *testing.T) {
-	// Create a temporary directory for the test
+	// Create a temporary directory for the test.
+	// Note: os.MkdirTemp returns a native path (e.g., "C:\Users\..." on Windows).
 	tmpDir, err := os.MkdirTemp("", "basefs-fstesting-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
@@ -24,7 +25,11 @@ func TestBaseFSSuite(t *testing.T) {
 		t.Fatalf("failed to create osfs: %v", err)
 	}
 
-	// Create basefs rooted at the temp directory
+	// Create basefs rooted at the temp directory.
+	// basefs.NewFS expects a path that the underlying filesystem can stat.
+	// When using osfs as the underlying fs, native paths work because osfs
+	// detects and handles them. For other underlying filesystems, you may
+	// need to convert the path appropriately.
 	fs, err := NewFS(underlying, tmpDir)
 	if err != nil {
 		t.Fatalf("failed to create basefs: %v", err)
