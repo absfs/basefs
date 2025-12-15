@@ -108,7 +108,9 @@ func TestBaseFSSuite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tempdir := ofs.TempDir()
+	// ofs.TempDir() returns a Unix-style path (e.g., "/c/Users/.../Temp" on Windows).
+	// basefs.NewFS expects a native path for filepath.IsAbs() check, so we convert it.
+	tempdir := osfs.ToNative(ofs.TempDir())
 	bfs, err := basefs.NewFS(ofs, tempdir)
 	if err != nil {
 		t.Fatal(err)
