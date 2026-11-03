@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Lstat` returns a `FileInfo` named like `Stat` does (`/` for the root).
 - `NewFS` and `NewFileSystem` clean the root, so `Prefix` returns the cleaned root (for example without a trailing separator). On Windows, Unix-style roots such as `/data` are accepted for virtual underlying filesystems.
 - `Unwrap` and `Prefix` now also handle `*FileSystem`, not just `*SymlinkFileSystem`.
-- `Symlink` stores a relative target verbatim and an absolute target as the root's host path followed by the target, so `Readlink` returns exactly the text given to `Symlink` (for example `../README.md`, `/a/../b`). Programs reading an absolute link directly on the host see the host path under the root.
+- `Symlink` stores a relative target verbatim and an absolute target as the root's host path followed by the target, so `Readlink` returns exactly the text given to `Symlink` (for example `../README.md`, `/a/../b`; on Windows, which stores absolute link targets cleaned, `/a/../b` reads back as `/b`). Programs reading an absolute link directly on the host see the host path under the root.
 - `FileSystem` and `SymlinkFileSystem` share a single `baseFS` implementation of every common method.
 
 ### Fixed

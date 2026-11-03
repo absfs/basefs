@@ -584,8 +584,9 @@ func verbatimRel(root, host string) (string, bool) {
 //     the link directly from the underlying filesystem, bypassing basefs,
 //     sees that host path (for example "/srv/data/a/f" for a root of
 //     /srv/data), and the link breaks if the root directory itself is moved
-//     on the host. On Windows the separators of an absolute oldname are
-//     reported back by Readlink as forward slashes.
+//     on the host. On Windows an absolute oldname reads back with forward
+//     slashes, and cleaned, because the host itself stores absolute targets
+//     cleaned ("/a/../b" reads back as "/b").
 //
 // At creation, oldname is checked lexically: a relative oldname is joined to
 // the directory of newname, and ".." elements are applied to the name
