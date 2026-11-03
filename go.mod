@@ -6,5 +6,8 @@ require (
 	github.com/absfs/absfs v1.0.0
 	github.com/absfs/fstesting v1.0.0
 	github.com/absfs/fstools v0.9.1
+	github.com/absfs/memfs v1.1.0
 	github.com/absfs/osfs v1.0.1-0.20251215210911-de085c499e3f
 )
+
+require github.com/absfs/inode v1.0.0 // indirect

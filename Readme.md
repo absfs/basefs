@@ -5,9 +5,35 @@
 [![CI](https://github.com/absfs/basefs/actions/workflows/ci.yml/badge.svg)](https://github.com/absfs/basefs/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-The `basefs` package implements the `absfs.FileSystem` interface by constraining a `absfs.FileSystem` to a specific subdirectory. A basefs filesystem will essentially be re-rooted to the provided subdirectory and no path navigation will allow access to paths outside of the subdirectory. All paths the are passed to the underlying filesystem are absolute paths constructed by the basefs to avoid ambiguity. After constructing the correct path basefs calls the underlying Filesystem methods normally. `basefs` will also edit any errors returned to reflect the path as it would appear if the prefix was removed.
+The `basefs` package implements the `absfs.FileSystem` interface by constraining a `absfs.FileSystem` to a specific subdirectory. A basefs filesystem is re-rooted at that directory: its `/` is the directory, and no name can reach a path outside it. Every path passed to the underlying filesystem is an absolute path that basefs constructs to avoid ambiguity. basefs then calls the underlying filesystem's methods normally. Errors report the name the caller passed in, never the underlying host path.
 
 The `basefs` package also provides `Prefix` and `Unwrap` functions for debugging purposes.
+
+## Containment
+
+Names are resolved lexically:
+
+1. A relative name is joined to the working directory (see `Chdir`/`Getwd`). An empty name means the working directory.
+2. The result is cleaned. A name whose `..` elements would climb above `/` is rejected with an `*os.PathError` (or `*os.LinkError` for `Rename` and `Symlink`) wrapping `basefs.ErrPathEscapes`. `"/.."` and `"../x"` at the root are rejected rather than clamped.
+3. The cleaned name is joined to the root, and the result must be the root itself or lie below it on a path-separator boundary. A root of `/d/x` never reaches the sibling `/d/xfoo`.
+
+An absolute host path is just a name inside the root: with a root of `/srv/data`, the name `/etc/passwd` means `/srv/data/etc/passwd`.
+
+On Windows, `\` is a separator as well as `/`. Names carrying a volume (`C:\x`, `c:x`, `\\server\share`, `\\?\C:\x`) and reserved device names (`NUL`, `CON`, ...) are rejected with `ErrPathEscapes`. Native (`C:\data`) and osfs-style (`/c/data`) roots are both accepted.
+
+### Symbolic links
+
+basefs constrains **names**, not what the underlying filesystem does with them. When the underlying filesystem follows symlinks, as `osfs` does through the host OS, a link inside the root whose target lies outside it is followed out of the root. basefs does the following:
+
+- `Symlink` refuses to create a link whose target resolves outside the root, lexically from the link's directory. An absolute target is a virtual path and is stored as the matching path under the root.
+- `Readlink` returns a relative target unchanged and maps an absolute target inside the root back to a virtual path. It never reveals an absolute target outside the root: it returns `ErrPathEscapes` instead.
+- A link placed by another process, or replaced between a check and a use, is still followed by the host. If the tree may contain untrusted links, use an OS-level mechanism (`os.Root`, a chroot, or a container).
+
+### Other methods
+
+- `Chdir` requires an existing directory inside the root. `Getwd` returns a virtual path.
+- `TempDir` returns the underlying temporary directory as a virtual path if it lies inside the root, and `/tmp` otherwise.
+- `Sub` returns a read-only `fs.FS` that operates through the basefs, so it is confined as well.
 
 
 ## Install 

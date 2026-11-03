@@ -1,3 +1,29 @@
+// Package basefs re-roots an absfs filesystem at one of its directories.
+//
+// A basefs filesystem presents a Unix-style virtual namespace whose "/" is a
+// directory (the base, or root) of an underlying absfs.FileSystem. Every name
+// a caller passes in is resolved lexically: it is joined to the current
+// working directory if relative, cleaned, and rejected with ErrPathEscapes if
+// its ".." elements would climb above the root. Only then is it joined to the
+// root to form the path given to the underlying filesystem, and that path is
+// checked once more to lie on or below the root on a path-separator boundary.
+// A root of /d/x therefore never reaches a sibling such as /d/xfoo.
+//
+// On Windows, backslashes in names are treated as separators, and names that
+// carry a volume (C:\x, c:x, \\server\share, \\?\C:\x) or a reserved device
+// name (CON, NUL, ...) are rejected with ErrPathEscapes.
+//
+// What basefs guarantees is limited to names: it never hands the underlying
+// filesystem a path outside the root. It does not control what the
+// underlying filesystem does with that path. In particular, when the
+// underlying filesystem follows symbolic links (as osfs does, through the
+// host OS), a link inside the root whose target lies outside it is followed
+// out of the root. basefs refuses to create such links through Symlink, and
+// Readlink never reports a host path outside the root, but a link placed by
+// another process is still followed by the host. Use an OS-level mechanism
+// (os.Root, a chroot, a container) when the tree may contain untrusted links.
+//
+// Errors report the caller's names, never the underlying host paths.
 package basefs
 
 import (
@@ -14,616 +40,500 @@ import (
 	"github.com/absfs/absfs"
 )
 
-// normalizeForComparison converts a path to a canonical format for comparison.
-// This handles the case where paths may be in different formats (e.g., "C:\Users\..."
-// vs "/c/Users/..." on Windows when using osfs as the underlying filesystem).
-func normalizeForComparison(p string) string {
-	// Convert to forward slashes
-	p = filepath.ToSlash(p)
+// ErrPathEscapes is the error (wrapped in an *os.PathError or *os.LinkError)
+// returned when a name, symlink target, or symlink content would resolve to a
+// location outside the basefs root.
+var ErrPathEscapes = errors.New("path escapes from base directory")
 
-	// On Windows, also handle drive letter normalization: C:/... → /c/...
-	if runtime.GOOS == "windows" && len(p) >= 2 && p[1] == ':' && unicode.IsLetter(rune(p[0])) {
-		drive := strings.ToLower(string(p[0]))
-		rest := ""
-		if len(p) > 2 {
-			rest = p[2:]
-		}
-		p = "/" + drive + rest
+// windowsPaths enables Windows path rules (backslash separators, volume
+// names, case-insensitive root comparison). It is a variable so the rules can
+// be unit tested on every platform.
+var windowsPaths = runtime.GOOS == "windows"
+
+// toSlash converts Windows separators to forward slashes when Windows path
+// rules apply. On other systems a backslash is an ordinary file name byte.
+func toSlash(p string) string {
+	if windowsPaths {
+		return strings.ReplaceAll(p, `\`, "/")
 	}
 	return p
 }
 
-// baseFS contains the common implementation shared by FileSystem and SymlinkFileSystem
-type baseFS struct {
-	cwd    string
-	prefix string
+// hasVolume reports whether p begins with a Windows volume: a drive letter
+// ("C:", "c:x") or two leading separators (UNC "\\server\share" and the
+// device forms "\\?\" and "\\.\").
+func hasVolume(p string) bool {
+	if len(p) < 2 {
+		return false
+	}
+	if p[1] == ':' && unicode.IsLetter(rune(p[0])) {
+		return true
+	}
+	return isSep(p[0]) && isSep(p[1])
 }
 
-// Common methods shared by both FileSystem and SymlinkFileSystem
+func isSep(c byte) bool {
+	return c == '/' || c == '\\'
+}
 
-func (b *baseFS) Chdir(dir string) error {
-	dir = path.Clean(dir)
-	if path.IsAbs(dir) {
-		b.cwd = dir
-		return nil
+// normalizeForComparison converts a path to a canonical format for comparison.
+// This handles the case where paths may be in different formats (e.g., "C:\Users\..."
+// vs "/c/Users/..." on Windows when using osfs as the underlying filesystem).
+func normalizeForComparison(p string) string {
+	p = toSlash(p)
+
+	// On Windows, also handle drive letter normalization: C:/... → /c/...
+	if windowsPaths && len(p) >= 2 && p[1] == ':' && unicode.IsLetter(rune(p[0])) {
+		p = "/" + strings.ToLower(p[:1]) + "/" + p[2:]
 	}
 
-	b.cwd = path.Join(b.cwd, dir)
+	// Clean, keeping a UNC "//" lead intact on Windows.
+	if windowsPaths && strings.HasPrefix(p, "//") {
+		return "/" + path.Clean(p)
+	}
+	return path.Clean(p)
+}
+
+// relTo reports whether host lies on or below root, comparing on path
+// separator boundaries, and if so returns the equivalent virtual path.
+func relTo(root, host string) (string, bool) {
+	r := normalizeForComparison(root)
+	h := normalizeForComparison(host)
+	if equalPath(h, r) {
+		return "/", true
+	}
+	if !strings.HasSuffix(r, "/") {
+		r += "/"
+	}
+	if len(h) <= len(r) || !equalPath(h[:len(r)], r) {
+		return "", false
+	}
+	return "/" + h[len(r):], true
+}
+
+func equalPath(a, b string) bool {
+	if windowsPaths {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+// cleanVirtual cleans an absolute virtual path without clamping ".." at the
+// root, reporting false if the path climbs above "/".
+func cleanVirtual(p string) (string, bool) {
+	rel := path.Clean(strings.TrimLeft(p, "/"))
+	if rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", false
+	}
+	if runtime.GOOS == "windows" && rel != "." && !filepath.IsLocal(rel) {
+		// Reserved device names (CON, NUL, ...) and other non-local forms.
+		return "", false
+	}
+	if rel == "." {
+		return "/", true
+	}
+	return "/" + rel, true
+}
+
+// baseFS contains the implementation shared by FileSystem and SymlinkFileSystem.
+type baseFS struct {
+	cwd    string // clean, absolute virtual path
+	prefix string // cleaned root in the underlying filesystem's syntax
+	fs     absfs.FileSystem
+}
+
+// newBase validates dir and returns a baseFS rooted at it.
+func newBase(fsys absfs.FileSystem, dir string) (baseFS, error) {
+	if dir == "" {
+		return baseFS{}, os.ErrInvalid
+	}
+	if !path.IsAbs(dir) && !filepath.IsAbs(dir) {
+		return baseFS{}, errors.New("not an absolute path")
+	}
+	if hasVolume(dir) {
+		dir = filepath.Clean(dir)
+	} else {
+		dir = path.Clean(dir)
+	}
+	info, err := fsys.Stat(dir)
+	if err != nil {
+		return baseFS{}, err
+	}
+	if !info.IsDir() {
+		return baseFS{}, errors.New("not a directory")
+	}
+	return baseFS{cwd: "/", prefix: dir, fs: fsys}, nil
+}
+
+// virtual resolves name to a clean, absolute virtual path, reporting false if
+// it would leave the root.
+func (b *baseFS) virtual(name string) (string, bool) {
+	if windowsPaths && hasVolume(name) {
+		return "", false
+	}
+	name = toSlash(name)
+	if name == "" {
+		return b.cwd, true
+	}
+	if !path.IsAbs(name) {
+		name = b.cwd + "/" + name
+	}
+	return cleanVirtual(name)
+}
+
+// host joins a clean virtual path to the root.
+func (b *baseFS) host(vpath string) string {
+	if vpath == "/" {
+		return b.prefix
+	}
+	rel, sep := vpath[1:], "/"
+	if windowsPaths && hasVolume(b.prefix) {
+		rel, sep = strings.ReplaceAll(rel, "/", `\`), `\`
+	}
+	if strings.HasSuffix(b.prefix, sep) {
+		return b.prefix + rel
+	}
+	return b.prefix + sep + rel
+}
+
+// path resolves name to its virtual and host paths. A name that escapes the
+// root yields an *os.PathError for op wrapping ErrPathEscapes.
+func (b *baseFS) path(op, name string) (vpath, hpath string, err error) {
+	vpath, ok := b.virtual(name)
+	if ok {
+		hpath = b.host(vpath)
+		// Defence in depth: the joined path must sit on or below the root
+		// on a separator boundary.
+		_, ok = relTo(b.prefix, hpath)
+	}
+	if !ok {
+		return "", "", &os.PathError{Op: op, Path: name, Err: ErrPathEscapes}
+	}
+	return vpath, hpath, nil
+}
+
+// Chdir changes the current working directory. The directory must exist
+// inside the root.
+func (b *baseFS) Chdir(dir string) error {
+	vpath, hpath, err := b.path("chdir", dir)
+	if err != nil {
+		return err
+	}
+	info, err := b.fs.Stat(hpath)
+	if err != nil {
+		return b.fixErr("chdir", dir, err)
+	}
+	if !info.IsDir() {
+		return &os.PathError{Op: "chdir", Path: dir, Err: errors.New("not a directory")}
+	}
+	b.cwd = vpath
 	return nil
 }
 
+// Getwd returns the current working directory as a virtual path.
 func (b *baseFS) Getwd() (dir string, err error) {
 	return b.cwd, nil
 }
 
-func (b *baseFS) path(name string) (string, error) {
-	if name == "" {
-		name = b.cwd
+// TempDir returns the underlying filesystem's temporary directory as a virtual
+// path if it lies inside the root, and "/tmp" otherwise.
+func (b *baseFS) TempDir() string {
+	if vpath, ok := relTo(b.prefix, b.fs.TempDir()); ok {
+		return vpath
 	}
-
-	if name == "/" {
-		return b.prefix, nil
-	}
-
-	if !path.IsAbs(name) {
-		name = path.Clean(name)
-	}
-	// Use path.Join for Unix-style virtual paths, then convert to OS-native
-	// for the underlying filesystem operations
-	name = path.Join(b.prefix, name)
-
-	// We mustn't let any trickery escape the prefix path.
-	if !strings.HasPrefix(name, b.prefix) {
-		return "", &os.PathError{Op: "open", Path: name, Err: errors.New("no such file or directory")}
-	}
-	return name, nil
-}
-
-type SymlinkFileSystem struct {
-	baseFS
-	fs absfs.SymlinkFileSystem
-}
-
-// NewFS creates a new SymlinkFileSystem from a `absfs.SymlinkFileSystem` compatible object
-// and a path. The path must be an absolute path (Unix-style, starting with /)
-// and must already exist in the fs provided otherwise an error is returned.
-func NewFS(fs absfs.SymlinkFileSystem, dir string) (*SymlinkFileSystem, error) {
-	if dir == "" {
-		return nil, os.ErrInvalid
-	}
-
-	if !filepath.IsAbs(dir) {
-		return nil, errors.New("not an absolute path")
-	}
-	info, err := fs.Stat(dir)
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() {
-		return nil, errors.New("not a directory")
-	}
-
-	return &SymlinkFileSystem{
-		baseFS: baseFS{cwd: "/", prefix: dir},
-		fs:     fs,
-	}, nil
+	return "/tmp"
 }
 
 // OpenFile opens a file using the given flags and the given mode.
-func (f *SymlinkFileSystem) OpenFile(name string, flags int, perm os.FileMode) (absfs.File, error) {
-	// flag := absfs.Flags(flags)
-	ppath, err := f.path(name)
+func (b *baseFS) OpenFile(name string, flags int, perm os.FileMode) (absfs.File, error) {
+	_, hpath, err := b.path("open", name)
 	if err != nil {
 		return new(absfs.InvalidFile), err
 	}
-
-	file, err := f.fs.OpenFile(ppath, flags, perm)
+	file, err := b.fs.OpenFile(hpath, flags, perm)
 	if err != nil {
-		return new(absfs.InvalidFile), err
+		return new(absfs.InvalidFile), b.fixErr("open", name, err)
 	}
+	return &File{file, b, name}, nil
+}
 
-	return &File{file, f.prefix, name}, fixerr(f.prefix, err)
+// Open opens the named file for reading.
+func (b *baseFS) Open(name string) (absfs.File, error) {
+	_, hpath, err := b.path("open", name)
+	if err != nil {
+		return nil, err
+	}
+	file, err := b.fs.Open(hpath)
+	if err != nil {
+		return nil, b.fixErr("open", name, err)
+	}
+	return &File{file, b, name}, nil
+}
+
+// Create creates or truncates the named file.
+func (b *baseFS) Create(name string) (absfs.File, error) {
+	_, hpath, err := b.path("open", name)
+	if err != nil {
+		return nil, err
+	}
+	file, err := b.fs.Create(hpath)
+	if err != nil {
+		return nil, b.fixErr("open", name, err)
+	}
+	return &File{file, b, name}, nil
 }
 
 // Mkdir creates a directory in the filesystem, return an error if any
 // happens.
-func (f *SymlinkFileSystem) Mkdir(name string, perm os.FileMode) error {
-	ppath, err := f.path(name)
+func (b *baseFS) Mkdir(name string, perm os.FileMode) error {
+	_, hpath, err := b.path("mkdir", name)
 	if err != nil {
 		return err
 	}
-	err = f.fs.Mkdir(ppath, perm)
-	return fixerr(f.prefix, err)
+	return b.fixErr("mkdir", name, b.fs.Mkdir(hpath, perm))
+}
+
+// MkdirAll creates a directory and any missing parents.
+func (b *baseFS) MkdirAll(name string, perm os.FileMode) error {
+	_, hpath, err := b.path("mkdir", name)
+	if err != nil {
+		return err
+	}
+	return b.fixErr("mkdir", name, b.fs.MkdirAll(hpath, perm))
 }
 
 // Remove removes a file identified by name, returning an error, if any
 // happens.
-func (f *SymlinkFileSystem) Remove(name string) error {
-	ppath, err := f.path(name)
+func (b *baseFS) Remove(name string) error {
+	_, hpath, err := b.path("remove", name)
 	if err != nil {
 		return err
 	}
-
-	err = f.fs.Remove(ppath)
-	return fixerr(f.prefix, err)
+	return b.fixErr("remove", name, b.fs.Remove(hpath))
 }
 
-func (f *SymlinkFileSystem) Rename(oldname, newname string) error {
-	linkErr := os.LinkError{Op: "rename", Old: oldname, New: newname}
-	oldpath, err := f.path(oldname)
+// RemoveAll removes name and any children it contains.
+func (b *baseFS) RemoveAll(name string) error {
+	_, hpath, err := b.path("remove", name)
 	if err != nil {
-		linkErr.Err = err
-		return &linkErr
+		return err
 	}
-	newpath, err := f.path(newname)
-	if err != nil {
-		linkErr.Err = err
-		return &linkErr
+	return b.fixErr("remove", name, b.fs.RemoveAll(hpath))
+}
+
+// Rename renames (moves) oldname to newname. Both must lie inside the root.
+func (b *baseFS) Rename(oldname, newname string) error {
+	_, oldpath, err := b.path("rename", oldname)
+	if err == nil {
+		var newpath string
+		_, newpath, err = b.path("rename", newname)
+		if err == nil {
+			err = b.fs.Rename(oldpath, newpath)
+		}
 	}
-	err = f.fs.Rename(oldpath, newpath)
-	return fixerr(f.prefix, err)
+	return b.fixLinkErr("rename", oldname, newname, err)
 }
 
 // Stat returns the FileInfo structure describing file. If there is an error,
 // it will be of type *PathError.
-func (f *SymlinkFileSystem) Stat(name string) (os.FileInfo, error) {
-	ppath, err := f.path(name)
+func (b *baseFS) Stat(name string) (os.FileInfo, error) {
+	vpath, hpath, err := b.path("stat", name)
 	if err != nil {
 		return nil, err
 	}
-
-	info, err := f.fs.Stat(ppath)
+	info, err := b.fs.Stat(hpath)
 	if err != nil {
-		return nil, fixerr(f.prefix, err)
+		return nil, b.fixErr("stat", name, err)
 	}
-
-	return &fileinfo{info, path.Base(name)}, nil
+	return &fileinfo{info, path.Base(vpath)}, nil
 }
 
 // Chmod changes the mode of the named file to mode.
-func (f *SymlinkFileSystem) Chmod(name string, mode os.FileMode) error {
-	ppath, err := f.path(name)
+func (b *baseFS) Chmod(name string, mode os.FileMode) error {
+	_, hpath, err := b.path("chmod", name)
 	if err != nil {
 		return err
 	}
-
-	err = f.fs.Chmod(ppath, mode)
-	return fixerr(f.prefix, err)
+	return b.fixErr("chmod", name, b.fs.Chmod(hpath, mode))
 }
 
 // Chtimes changes the access and modification times of the named file
-func (f *SymlinkFileSystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
-	ppath, err := f.path(name)
+func (b *baseFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	_, hpath, err := b.path("chtimes", name)
 	if err != nil {
 		return err
 	}
-	err = f.fs.Chtimes(ppath, atime, mtime)
-	return fixerr(f.prefix, err)
+	return b.fixErr("chtimes", name, b.fs.Chtimes(hpath, atime, mtime))
 }
 
 // Chown changes the owner and group ids of the named file
-func (f *SymlinkFileSystem) Chown(name string, uid, gid int) error {
-	ppath, err := f.path(name)
+func (b *baseFS) Chown(name string, uid, gid int) error {
+	_, hpath, err := b.path("chown", name)
 	if err != nil {
 		return err
 	}
-
-	err = f.fs.Chown(ppath, uid, gid)
-	return fixerr(f.prefix, err)
+	return b.fixErr("chown", name, b.fs.Chown(hpath, uid, gid))
 }
 
-func (f *SymlinkFileSystem) TempDir() string {
-	tmpdir := f.fs.TempDir()
-
-	if strings.HasPrefix(tmpdir, f.prefix+"/") {
-		return strings.TrimPrefix(tmpdir, f.prefix)
-	}
-
-	// We can't return the underlying TempDir if it breaks out of the prefix path.
-	return "/tmp"
-}
-
-func (f *SymlinkFileSystem) Open(name string) (absfs.File, error) {
-	ppath, err := f.path(name)
-	if err != nil {
-		return nil, err
-	}
-
-	file, err := f.fs.Open(ppath)
-	if err != nil {
-		err = fixerr(f.prefix, err)
-		return nil, err
-	}
-
-	return &File{file, f.prefix, name}, nil
-}
-
-func (f *SymlinkFileSystem) Create(name string) (absfs.File, error) {
-	ppath, err := f.path(name)
-	if err != nil {
-		return nil, err
-	}
-
-	file, err := f.fs.Create(ppath)
-	if err != nil {
-		return nil, err
-	}
-
-	return &File{file, f.prefix, name}, err
-}
-
-func (f *SymlinkFileSystem) MkdirAll(name string, perm os.FileMode) error {
-	ppath, err := f.path(name)
+// Truncate changes the size of the named file.
+func (b *baseFS) Truncate(name string, size int64) error {
+	_, hpath, err := b.path("truncate", name)
 	if err != nil {
 		return err
 	}
-
-	return f.fs.MkdirAll(ppath, perm)
+	return b.fixErr("truncate", name, b.fs.Truncate(hpath, size))
 }
 
-func (f *SymlinkFileSystem) RemoveAll(name string) error {
-	ppath, err := f.path(name)
+// ReadDir reads the named directory and returns a list of directory entries sorted by filename.
+func (b *baseFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	_, hpath, err := b.path("open", name)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	return f.fs.RemoveAll(ppath)
+	entries, err := b.fs.ReadDir(hpath)
+	return entries, b.fixErr("open", name, err)
 }
 
-func (f *SymlinkFileSystem) Truncate(name string, size int64) error {
-	ppath, err := f.path(name)
+// ReadFile reads the named file and returns its contents.
+func (b *baseFS) ReadFile(name string) ([]byte, error) {
+	_, hpath, err := b.path("open", name)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	return f.fs.Truncate(ppath, size)
+	data, err := b.fs.ReadFile(hpath)
+	return data, b.fixErr("open", name, err)
 }
 
+// Sub returns a read-only fs.FS for the subtree rooted at dir. The returned
+// FS operates through this basefs, so it is confined to the root as well.
+func (b *baseFS) Sub(dir string) (fs.FS, error) {
+	vpath, _, err := b.path("sub", dir)
+	if err != nil {
+		return nil, err
+	}
+	sub, err := absfs.FilerToFS(b, vpath)
+	if err != nil {
+		return nil, b.fixErr("sub", dir, err)
+	}
+	return sub, nil
+}
+
+// SymlinkFileSystem is a basefs over an absfs.SymlinkFileSystem.
+type SymlinkFileSystem struct {
+	baseFS
+	sfs absfs.SymlinkFileSystem
+}
+
+var _ absfs.SymlinkFileSystem = (*SymlinkFileSystem)(nil)
+
+// NewFS creates a new SymlinkFileSystem from a `absfs.SymlinkFileSystem` compatible object
+// and a path. The path must be absolute (Unix-style, or native on Windows)
+// and must already exist in the fs provided otherwise an error is returned.
+func NewFS(fs absfs.SymlinkFileSystem, dir string) (*SymlinkFileSystem, error) {
+	base, err := newBase(fs, dir)
+	if err != nil {
+		return nil, err
+	}
+	return &SymlinkFileSystem{baseFS: base, sfs: fs}, nil
+}
+
+// Lstat returns the FileInfo for name without following a final symlink.
 func (f *SymlinkFileSystem) Lstat(name string) (os.FileInfo, error) {
-	ppath, err := f.path(name)
+	vpath, hpath, err := f.path("lstat", name)
 	if err != nil {
 		return nil, err
 	}
-
-	info, err := f.fs.Lstat(ppath)
-	return info, fixerr(f.prefix, err)
+	info, err := f.sfs.Lstat(hpath)
+	if err != nil {
+		return nil, f.fixErr("lstat", name, err)
+	}
+	return &fileinfo{info, path.Base(vpath)}, nil
 }
 
-// ess
-
+// Lchown changes the owner and group ids of name without following a final
+// symlink.
 func (f *SymlinkFileSystem) Lchown(name string, uid, gid int) error {
-	ppath, err := f.path(name)
+	_, hpath, err := f.path("lchown", name)
 	if err != nil {
 		return err
 	}
-
-	err = f.fs.Lchown(ppath, uid, gid)
-	return fixerr(f.prefix, err)
+	return f.fixErr("lchown", name, f.sfs.Lchown(hpath, uid, gid))
 }
 
+// Readlink returns the target of the symlink name.
+//
+// A relative target is returned unchanged; it is relative to the link's
+// directory. An absolute target inside the root is returned as a virtual
+// path. An absolute target outside the root has no virtual equivalent and is
+// never revealed: Readlink returns an *os.PathError wrapping ErrPathEscapes.
 func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
-	ppath, err := f.path(name)
+	_, hpath, err := f.path("readlink", name)
 	if err != nil {
 		return "", err
 	}
-
-	target, err := f.fs.Readlink(ppath)
+	target, err := f.sfs.Readlink(hpath)
 	if err != nil {
-		return "", fixerr(f.prefix, err)
+		return "", f.fixErr("readlink", name, err)
 	}
 
-	// If the target is a relative path, return it as-is
-	// (relative symlinks are relative to the link location, not the basefs root)
-	if !path.IsAbs(target) && !filepath.IsAbs(target) {
+	// Relative symlinks are relative to the link location, not the root.
+	if !path.IsAbs(target) && !filepath.IsAbs(target) && !(windowsPaths && hasVolume(target)) {
 		return target, nil
 	}
-
-	// Normalize both paths to a common format for comparison.
-	// This handles cases where the underlying fs returns paths in different formats
-	// (e.g., osfs returns "/c/Users/..." on Windows, but prefix may be "C:\Users\...")
-	normalizedTarget := normalizeForComparison(target)
-	normalizedPrefix := normalizeForComparison(f.prefix)
-
-	// If the target is within our prefix, convert it to a virtual path
-	if strings.HasPrefix(normalizedTarget, normalizedPrefix) {
-		target = strings.TrimPrefix(normalizedTarget, normalizedPrefix)
-		// Ensure the result is an absolute path and clean it
-		if target == "" || !strings.HasPrefix(target, "/") {
-			target = "/" + target
-		}
-		target = path.Clean(target)
+	vpath, ok := relTo(f.prefix, target)
+	if !ok {
+		return "", &os.PathError{Op: "readlink", Path: name, Err: ErrPathEscapes}
 	}
-
-	return target, nil
+	return vpath, nil
 }
 
+// Symlink creates newname as a symbolic link to oldname.
+//
+// An absolute oldname is a virtual path and is stored as the corresponding
+// path under the root. A relative oldname is stored unchanged. Either way the
+// target must resolve, lexically from the link's directory, to a location
+// inside the root; otherwise Symlink returns an *os.LinkError wrapping
+// ErrPathEscapes and creates nothing.
 func (f *SymlinkFileSystem) Symlink(oldname, newname string) error {
-	// Only translate newname (the link path) through basefs prefix
-	// oldname (the target) should be:
-	// - Kept as-is if relative (symlink target is relative to link location)
-	// - Translated if absolute (symlink target points to absolute path in virtual fs)
-	pnewname, err := f.path(newname)
+	vlink, hlink, err := f.path("symlink", newname)
 	if err != nil {
-		return err
+		return f.fixLinkErr("symlink", oldname, newname, err)
 	}
 
-	var target string
-	if path.IsAbs(oldname) {
-		// Absolute virtual path - translate to real path
-		target, err = f.path(oldname)
-		if err != nil {
-			return err
+	target := toSlash(oldname)
+	escapes := windowsPaths && hasVolume(oldname)
+	if !escapes {
+		var vtarget string
+		var ok bool
+		if path.IsAbs(target) {
+			if vtarget, ok = cleanVirtual(target); ok {
+				target = f.host(vtarget)
+			}
+		} else {
+			_, ok = cleanVirtual(path.Dir(vlink) + "/" + target)
 		}
-	} else {
-		// Relative path - keep as-is, symlink is relative to link location
-		target = oldname
+		escapes = !ok
 	}
-
-	err = f.fs.Symlink(target, pnewname)
-	return fixerr(f.prefix, err)
+	if escapes {
+		return &os.LinkError{Op: "symlink", Old: oldname, New: newname, Err: ErrPathEscapes}
+	}
+	return f.fixLinkErr("symlink", oldname, newname, f.sfs.Symlink(target, hlink))
 }
 
-// ReadDir reads the named directory and returns a list of directory entries sorted by filename.
-func (f *SymlinkFileSystem) ReadDir(name string) ([]fs.DirEntry, error) {
-	ppath, err := f.path(name)
-	if err != nil {
-		return nil, err
-	}
-
-	entries, err := f.fs.ReadDir(ppath)
-	return entries, fixerr(f.prefix, err)
-}
-
-// ReadFile reads the named file and returns its contents.
-func (f *SymlinkFileSystem) ReadFile(name string) ([]byte, error) {
-	ppath, err := f.path(name)
-	if err != nil {
-		return nil, err
-	}
-
-	data, err := f.fs.ReadFile(ppath)
-	return data, fixerr(f.prefix, err)
-}
-
-// Sub returns an fs.FS corresponding to the subtree rooted at dir.
-func (f *SymlinkFileSystem) Sub(dir string) (fs.FS, error) {
-	ppath, err := f.path(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	return absfs.FilerToFS(f.fs, ppath)
-}
-
+// FileSystem is a basefs over an absfs.FileSystem without symlink support.
 type FileSystem struct {
 	baseFS
-	fs absfs.FileSystem
 }
+
+var _ absfs.FileSystem = (*FileSystem)(nil)
 
 // NewFileSystem creates a new FileSystem from a `absfs.FileSystem` compatible object
-// and a path. The path must be an absolute path (Unix-style, starting with /)
+// and a path. The path must be absolute (Unix-style, or native on Windows)
 // and must already exist in the fs provided otherwise an error is returned.
 func NewFileSystem(fs absfs.FileSystem, dir string) (*FileSystem, error) {
-	if dir == "" {
-		return nil, os.ErrInvalid
-	}
-
-	if !filepath.IsAbs(dir) {
-		return nil, errors.New("not an absolute path")
-	}
-	info, err := fs.Stat(dir)
+	base, err := newBase(fs, dir)
 	if err != nil {
 		return nil, err
 	}
-	if !info.IsDir() {
-		return nil, errors.New("not a directory")
-	}
-
-	return &FileSystem{
-		baseFS: baseFS{cwd: "/", prefix: dir},
-		fs:     fs,
-	}, nil
+	return &FileSystem{baseFS: base}, nil
 }
-
-// OpenFile opens a file using the given flags and the given mode.
-func (f *FileSystem) OpenFile(name string, flags int, perm os.FileMode) (absfs.File, error) {
-	// flag := absfs.Flags(flags)
-	ppath, err := f.path(name)
-	if err != nil {
-		return new(absfs.InvalidFile), err
-	}
-
-	file, err := f.fs.OpenFile(ppath, flags, perm)
-	if err != nil {
-		return new(absfs.InvalidFile), err
-	}
-
-	return &File{file, f.prefix, name}, fixerr(f.prefix, err)
-}
-
-// Mkdir creates a directory in the filesystem, return an error if any
-// happens.
-func (f *FileSystem) Mkdir(name string, perm os.FileMode) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-	err = f.fs.Mkdir(ppath, perm)
-	return fixerr(f.prefix, err)
-}
-
-// Remove removes a file identified by name, returning an error, if any
-// happens.
-func (f *FileSystem) Remove(name string) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-
-	err = f.fs.Remove(ppath)
-	return fixerr(f.prefix, err)
-}
-
-func (f *FileSystem) Rename(oldname, newname string) error {
-	linkErr := os.LinkError{Op: "rename", Old: oldname, New: newname}
-	oldpath, err := f.path(oldname)
-	if err != nil {
-		linkErr.Err = err
-		return &linkErr
-	}
-	newpath, err := f.path(newname)
-	if err != nil {
-		linkErr.Err = err
-		return &linkErr
-	}
-	err = f.fs.Rename(oldpath, newpath)
-	return fixerr(f.prefix, err)
-}
-
-// Stat returns the FileInfo structure describing file. If there is an error,
-// it will be of type *PathError.
-func (f *FileSystem) Stat(name string) (os.FileInfo, error) {
-	ppath, err := f.path(name)
-	if err != nil {
-		return nil, err
-	}
-
-	info, err := f.fs.Stat(ppath)
-	if err != nil {
-		return nil, fixerr(f.prefix, err)
-	}
-
-	return &fileinfo{info, path.Base(name)}, nil
-}
-
-// Chmod changes the mode of the named file to mode.
-func (f *FileSystem) Chmod(name string, mode os.FileMode) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-
-	err = f.fs.Chmod(ppath, mode)
-	return fixerr(f.prefix, err)
-}
-
-// Chtimes changes the access and modification times of the named file
-func (f *FileSystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-	err = f.fs.Chtimes(ppath, atime, mtime)
-	return fixerr(f.prefix, err)
-}
-
-// Chown changes the owner and group ids of the named file
-func (f *FileSystem) Chown(name string, uid, gid int) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-
-	err = f.fs.Chown(ppath, uid, gid)
-	return fixerr(f.prefix, err)
-}
-
-func (f *FileSystem) TempDir() string {
-	tmpdir := f.fs.TempDir()
-
-	if strings.HasPrefix(tmpdir, f.prefix+"/") {
-		return strings.TrimPrefix(tmpdir, f.prefix)
-	}
-
-	// We can't return the underlying TempDir if it breaks out of the prefix path.
-	return "/tmp"
-}
-
-func (f *FileSystem) Open(name string) (absfs.File, error) {
-	ppath, err := f.path(name)
-	if err != nil {
-		return nil, err
-	}
-
-	file, err := f.fs.Open(ppath)
-	if err != nil {
-		err = fixerr(f.prefix, err)
-		return nil, err
-	}
-
-	return &File{file, f.prefix, name}, nil
-}
-
-func (f *FileSystem) Create(name string) (absfs.File, error) {
-	ppath, err := f.path(name)
-	if err != nil {
-		return nil, err
-	}
-
-	file, err := f.fs.Create(ppath)
-	if err != nil {
-		return nil, err
-	}
-
-	return &File{file, f.prefix, name}, err
-}
-
-func (f *FileSystem) MkdirAll(name string, perm os.FileMode) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-
-	return f.fs.MkdirAll(ppath, perm)
-}
-
-func (f *FileSystem) RemoveAll(name string) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-
-	return f.fs.RemoveAll(ppath)
-}
-
-func (f *FileSystem) Truncate(name string, size int64) error {
-	ppath, err := f.path(name)
-	if err != nil {
-		return err
-	}
-
-	return f.fs.Truncate(ppath, size)
-}
-
-// ReadDir reads the named directory and returns a list of directory entries sorted by filename.
-func (f *FileSystem) ReadDir(name string) ([]fs.DirEntry, error) {
-	ppath, err := f.path(name)
-	if err != nil {
-		return nil, err
-	}
-
-	entries, err := f.fs.ReadDir(ppath)
-	return entries, fixerr(f.prefix, err)
-}
-
-// ReadFile reads the named file and returns its contents.
-func (f *FileSystem) ReadFile(name string) ([]byte, error) {
-	ppath, err := f.path(name)
-	if err != nil {
-		return nil, err
-	}
-
-	data, err := f.fs.ReadFile(ppath)
-	return data, fixerr(f.prefix, err)
-}
-
-// Sub returns an fs.FS corresponding to the subtree rooted at dir.
-func (f *FileSystem) Sub(dir string) (fs.FS, error) {
-	ppath, err := f.path(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	return absfs.FilerToFS(f.fs, ppath)
-}
-

@@ -1,9 +1,11 @@
 package basefs_test
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/absfs/basefs"
 	"github.com/absfs/fstools"
@@ -115,7 +117,7 @@ func Example_pathSecurity() {
 	// Try to access a file outside the base directory using ../
 	// This will fail safely
 	_, err = bfs.Open("/../etc/passwd")
-	if err != nil {
+	if errors.Is(err, basefs.ErrPathEscapes) {
 		fmt.Println("Access denied: cannot escape base directory")
 	}
 
@@ -158,8 +160,8 @@ func ExamplePrefix() {
 	// Get the prefix (base directory)
 	prefix := basefs.Prefix(bfs)
 
-	// Verify the prefix matches what we set
-	if prefix == tmpdir {
+	// The prefix is the cleaned base directory
+	if prefix == filepath.Clean(tmpdir) {
 		fmt.Println("Prefix matches temp directory")
 	}
 	// Output: Prefix matches temp directory
