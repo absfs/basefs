@@ -7,7 +7,7 @@
 
 The `basefs` package implements the `absfs.FileSystem` interface by constraining a `absfs.FileSystem` to a specific subdirectory. A basefs filesystem is re-rooted at that directory: its `/` is the directory, and no name can reach a path outside it. Every path passed to the underlying filesystem is an absolute path that basefs constructs to avoid ambiguity. basefs then calls the underlying filesystem's methods normally. Errors report the name the caller passed in, never the underlying host path.
 
-The `basefs` package also provides `Prefix` and `Unwrap` functions for debugging purposes, and `Confined`, which reports whether the host is kept from following symlinks out of the root (see [Confinement over osfs](#confinement-over-osfs-osroot)).
+The `basefs` package also provides `Prefix` and `Unwrap` functions for debugging purposes, and `Confined`, which reports whether the host is kept from following symlinks out of the root (see [Confinement over osfs](#confinement-over-osfs-osroot)). `Close` releases the root directory that a confined basefs holds open.
 
 ## Containment
 
@@ -43,9 +43,14 @@ Any operation that follows a link can then act outside the root: reading, but al
 When the underlying filesystem can confine itself to the root, basefs lets it, and the host can then never follow a link out of the root. `NewFS` and `NewFileSystem` look for an `OpenRoot(dir string) (absfs.SymlinkFileSystem, error)` method on the underlying filesystem. If it has one, they operate through what it returns. `osfs` has one: with Go 1.25 or later on a Unix system it returns an `osfs.RootFS`, which resolves every name through an [`os.Root`](https://pkg.go.dev/os#Root).
 
 - Every case above fails with an error wrapping `ErrPathEscapes` instead of leaving the root. So does any link placed on the host that leads outside, and a directory swapped for such a link mid-operation.
-- Links that stay inside the root work as before. That includes absolute ones: basefs stores them as the root's host path followed by the target, and `RootFS` follows such a target inside the root. `Readlink` and `Symlink` are unchanged.
+- Links are judged on names, each step through `os.Root`, never by where the host would end up. A relative link that never leaves the root works, and so does an absolute link that starts with the root's path as given to `NewFS`, or its canonical path (`filepath.EvalSymlinks`). The absolute links basefs stores are of that kind: the root's host path followed by the target. A link that leaves the root fails even if it comes back in: `../x/f` for a root named `x`, or an absolute link that spells the root another way (`/srv/xfoo/../x/f`, or through a symlinked ancestor such as `/var/...` for a root given as `/private/var/...` on macOS). `Readlink` and `Symlink` are unchanged.
+- Host links that are meant to lead outside the root (a shared directory linked as `../shared`, an absolute link into `/usr`) no longer work. Use `NewFSUnconfined` or `NewFileSystemUnconfined` to keep following them, knowingly: they never call `OpenRoot` and constrain names only.
 - `Confined(fs)` reports whether a basefs is confined this way. `Unwrap` still returns the filesystem given to `NewFS`, which is not confined.
-- Before Go 1.25, and on Windows, `osfs.OpenRoot` reports `errors.ErrUnsupported`, and basefs constrains names only, as described above. Any other `OpenRoot` error fails `NewFS`.
+- Before Go 1.25, and on Windows, `osfs.OpenRoot` reports `errors.ErrUnsupported`, and basefs constrains names only, as described above. So it does when `OpenRoot` reports a permission error: `os.Root` must open the root for reading, so a root the process can search and write but not read (a drop box, mode `0333`) cannot be confined. Any other `OpenRoot` error fails `NewFS`.
+- A confined basefs holds the root directory open. `Close` releases it; operations after `Close` fail. A basefs that is not closed releases it when it is garbage collected, so a program that creates many basefs filesystems, or one per request, should close them. An open root also keeps its volume busy and stops it being unmounted.
+- A confined basefs is bound to the root directory, not its path. If the root is renamed on the host, the basefs keeps working in it at its new place, and a directory created at the old path is not seen. If the root is removed, every operation fails, even once a directory is created again at that path.
+- `RemoveAll("/")` removes everything in the root but keeps the root directory itself, which `os.Root` cannot remove. Unconfined, it removes the root directory too.
+- Errors report the same operation names as before (`open`, `stat`, `truncate`), not `os.Root`'s (`openat`, `statat`).
 
 Where `Confined` is false and the host's own resolution of links must stay inside the root, use another OS-level mechanism: a chroot or a container.
 

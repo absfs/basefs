@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        go: ['1.21', '1.22', '1.23', '1.25', 'stable']
+        go: ['1.23', '1.25', 'stable']
 
     steps:
       - name: Checkout code
@@ -37,7 +37,7 @@ jobs:
         run: go test -v -race ./...
 
       - name: Upload coverage
-        if: matrix.os == 'ubuntu-latest' && matrix.go == '1.23'
+        if: matrix.os == 'ubuntu-latest' && matrix.go == 'stable'
         uses: codecov/codecov-action@v4
         with:
           files: coverage.out

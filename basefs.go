@@ -46,18 +46,32 @@
 // a Unix system, returns a filesystem confined to the root by os.Root. The
 // host then never follows a link out of the root: each case above fails with
 // ErrPathEscapes, as does any link placed on the host that leads outside.
-// Absolute links that basefs stored still resolve inside the root. Confined
-// reports whether a basefs is confined this way. If OpenRoot reports
-// errors.ErrUnsupported (osfs before Go 1.25, or on Windows), basefs uses
-// the underlying filesystem directly and constrains names only. Use another
-// OS-level mechanism (a chroot, a container) when the host's own resolution
-// of links must stay inside the root there.
+// Links are judged on the names os.Root sees: a relative link that climbs
+// out and back in ("../root/f") fails too, and an absolute link resolves
+// inside the root only if it starts with the root's path as given to NewFS
+// or its canonical path (filepath.EvalSymlinks), as the absolute links that
+// basefs stores do. Confined reports whether a basefs is confined this way.
+// If OpenRoot reports errors.ErrUnsupported (osfs before Go 1.25, or on
+// Windows), or a permission error (os.Root must read the root, so a root
+// the process can search but not read, such as mode 0333, cannot be
+// opened), basefs uses the underlying filesystem directly and constrains
+// names only. Any other OpenRoot error makes NewFS fail. NewFSUnconfined and
+// NewFileSystemUnconfined never confine. Use another OS-level mechanism (a
+// chroot, a container) when the host's own resolution of links must stay
+// inside the root and Confined is false.
+//
+// A confined basefs holds its root directory open, until Close or garbage
+// collection, and is bound to that directory rather than to its path: if
+// the root is renamed on the host, the basefs follows it, and a directory
+// created at the old path is not seen; if the root is removed, every
+// operation fails, even after a directory is created at the same path.
 //
 // Errors report the caller's names, never the underlying host paths.
 package basefs
 
 import (
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -211,8 +225,9 @@ type baseFS struct {
 	confined absfs.SymlinkFileSystem // fs, when confined to the root
 }
 
-// newBase validates dir and returns a baseFS rooted at it.
-func newBase(fsys absfs.FileSystem, dir string) (baseFS, error) {
+// newBase validates dir and returns a baseFS rooted at it. With confine, it
+// operates through the underlying filesystem's OpenRoot where that works.
+func newBase(fsys absfs.FileSystem, dir string, confine bool) (baseFS, error) {
 	if dir == "" {
 		return baseFS{}, os.ErrInvalid
 	}
@@ -232,18 +247,35 @@ func newBase(fsys absfs.FileSystem, dir string) (baseFS, error) {
 		return baseFS{}, errors.New("not a directory")
 	}
 	b := baseFS{cwd: "/", prefix: dir, fs: fsys, under: fsys}
+	if !confine {
+		return b, nil
+	}
 	// Where the underlying filesystem can confine itself to the root (osfs
 	// with Go 1.25 on Unix), let it, so the host cannot follow a link out.
+	// os.Root must open the root for reading, so a root the process can
+	// search but not read (a drop box, mode 0333) stays unconfined.
 	if ro, ok := fsys.(rootOpener); ok {
 		confined, err := ro.OpenRoot(dir)
 		switch {
 		case err == nil:
 			b.fs, b.confined = confined, confined
-		case !errors.Is(err, errors.ErrUnsupported):
+		case !errors.Is(err, errors.ErrUnsupported) && !errors.Is(err, fs.ErrPermission):
 			return baseFS{}, err
 		}
 	}
 	return b, nil
+}
+
+// Close releases what a confined basefs holds open: the root directory of
+// the confined view of the underlying filesystem (an os.Root over osfs).
+// Operations after Close then fail, including through a Sub of it. Close of
+// an unconfined basefs does nothing and returns nil. A basefs that is not
+// closed releases the directory when it is garbage collected.
+func (b *baseFS) Close() error {
+	if c, ok := b.confined.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 // virtual resolves name to a clean, absolute virtual path, reporting false if
@@ -394,12 +426,34 @@ func (b *baseFS) Remove(name string) error {
 }
 
 // RemoveAll removes name and any children it contains.
+//
+// RemoveAll of the root ("/") removes everything in it. Unless the basefs is
+// Confined, it then removes the root directory too. A confined basefs keeps
+// the root directory, which it holds open: os.Root cannot remove its own
+// root.
 func (b *baseFS) RemoveAll(name string) error {
-	_, hpath, err := b.path("remove", name)
+	vpath, hpath, err := b.path("remove", name)
 	if err != nil {
 		return err
 	}
+	if vpath == "/" && b.confined != nil {
+		return b.fixErr("remove", name, b.removeChildren())
+	}
 	return b.fixErr("remove", name, b.fs.RemoveAll(hpath))
+}
+
+// removeChildren removes everything in the root, but not the root.
+func (b *baseFS) removeChildren() error {
+	entries, err := b.fs.ReadDir(b.prefix)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := b.fs.RemoveAll(b.host("/" + e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Rename renames (moves) oldname to newname. Both must lie inside the root.
@@ -510,8 +564,25 @@ var _ absfs.SymlinkFileSystem = (*SymlinkFileSystem)(nil)
 // NewFS creates a new SymlinkFileSystem from a `absfs.SymlinkFileSystem` compatible object
 // and a path. The path must be absolute (Unix-style, or native on Windows)
 // and must already exist in the fs provided otherwise an error is returned.
+//
+// Where fs has an OpenRoot method that succeeds for dir (osfs with Go 1.25
+// or later on a Unix system), the result is Confined; see the package
+// documentation. Call Close to release the root directory it holds open.
 func NewFS(fs absfs.SymlinkFileSystem, dir string) (*SymlinkFileSystem, error) {
-	base, err := newBase(fs, dir)
+	return newFS(fs, dir, true)
+}
+
+// NewFSUnconfined is NewFS without confinement: it never calls the
+// underlying filesystem's OpenRoot, so it constrains names only, and the
+// host follows symlinks wherever they lead, out of the root included. It
+// keeps the behaviour of NewFS before confinement, for trees whose links
+// are meant to lead outside the root.
+func NewFSUnconfined(fs absfs.SymlinkFileSystem, dir string) (*SymlinkFileSystem, error) {
+	return newFS(fs, dir, false)
+}
+
+func newFS(fs absfs.SymlinkFileSystem, dir string, confine bool) (*SymlinkFileSystem, error) {
+	base, err := newBase(fs, dir, confine)
 	if err != nil {
 		return nil, err
 	}
@@ -686,8 +757,21 @@ var _ absfs.FileSystem = (*FileSystem)(nil)
 // NewFileSystem creates a new FileSystem from a `absfs.FileSystem` compatible object
 // and a path. The path must be absolute (Unix-style, or native on Windows)
 // and must already exist in the fs provided otherwise an error is returned.
+//
+// Like NewFS, it confines itself where fs has an OpenRoot method that
+// succeeds for dir. Call Close to release the root directory it holds open.
 func NewFileSystem(fs absfs.FileSystem, dir string) (*FileSystem, error) {
-	base, err := newBase(fs, dir)
+	return newFileSystem(fs, dir, true)
+}
+
+// NewFileSystemUnconfined is NewFileSystem without confinement, as
+// NewFSUnconfined is for NewFS.
+func NewFileSystemUnconfined(fs absfs.FileSystem, dir string) (*FileSystem, error) {
+	return newFileSystem(fs, dir, false)
+}
+
+func newFileSystem(fs absfs.FileSystem, dir string, confine bool) (*FileSystem, error) {
+	base, err := newBase(fs, dir, confine)
 	if err != nil {
 		return nil, err
 	}

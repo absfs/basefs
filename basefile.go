@@ -71,16 +71,27 @@ func (b *baseFS) scrub(err error) error {
 // fixErr rewrites an error from the underlying filesystem as an
 // *os.PathError that reports the caller's name instead of the host path. A
 // bare error (some filesystems return a syscall.Errno) is wrapped under op.
+// A confined basefs always reports op, since os.Root reports its own *at
+// system call names (openat, statat, ...) rather than the os ones.
 func (b *baseFS) fixErr(op, name string, err error) error {
 	switch e := err.(type) {
 	case nil:
 		return nil
 	case *os.PathError:
-		op, err = e.Op, e.Err
+		op, err = b.op(op, e.Op), e.Err
 	case *os.LinkError:
-		op, err = e.Op, e.Err
+		op, err = b.op(op, e.Op), e.Err
 	}
 	return &os.PathError{Op: op, Path: name, Err: b.scrub(escapes(err))}
+}
+
+// op picks the operation name to report: the underlying filesystem's,
+// unless the basefs is confined.
+func (b *baseFS) op(own, under string) string {
+	if b.confined != nil {
+		return own
+	}
+	return under
 }
 
 // escapes reports a confined underlying filesystem's refusal to leave the
@@ -99,7 +110,7 @@ func (b *baseFS) fixLinkErr(op, oldname, newname string, err error) error {
 	case nil:
 		return nil
 	case *os.LinkError:
-		op, err = e.Op, e.Err
+		op, err = b.op(op, e.Op), e.Err
 	case *os.PathError:
 		err = e.Err
 	}
