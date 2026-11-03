@@ -221,12 +221,9 @@ func TestSymlinkWindowsRules(t *testing.T) {
 		`c:\ROOT`:        "/",
 		`C:\root\`:       "/",
 		`C:\root\a\..\b`: "/a/../b",
-		// As written it would climb above the root: reported cleaned.
-		`C:\root\..\root\a`:    "/a",
-		`C:\rootfoo\..\root\a`: "/a",
-		`c:root\a`:             "/a",
-		`..\sibling`:           `..\sibling`,
-		`relative\file`:        `relative\file`,
+		`c:root\a`:       "/a",
+		`..\sibling`:     `..\sibling`,
+		`relative\file`:  `relative\file`,
 	}
 	for target, want := range readlink {
 		lfs.target = target
@@ -234,7 +231,14 @@ func TestSymlinkWindowsRules(t *testing.T) {
 			t.Errorf("Readlink -> %q = %q, %v; want %q", target, got, err, want)
 		}
 	}
-	for _, target := range []string{`C:\rootfoo\x`, `D:\root\x`, `c:relative`, `\\srv\share\x`, "/c/other"} {
+	escapes := []string{
+		`C:\rootfoo\x`, `D:\root\x`, `c:relative`, `\\srv\share\x`, "/c/other",
+		// As written they climb above the root, though cleaning brings them back.
+		`C:\root\..\root\a`, `C:\rootfoo\..\root\a`,
+		// Rooted without a volume: absolute, as in Symlink, and not under the root.
+		`\Windows\System32`, `\root\a`,
+	}
+	for _, target := range escapes {
 		lfs.target = target
 		if got, err := f.Readlink("/link"); !errors.Is(err, ErrPathEscapes) || got != "" {
 			t.Errorf("Readlink -> %q = %q, %v; want ErrPathEscapes", target, got, err)
@@ -253,7 +257,7 @@ func TestSymlinkWindowsRules(t *testing.T) {
 	}
 	// An absolute target is stored under the root as written and reads back
 	// unchanged, with forward slashes.
-	for _, target := range []string{"/a/./b/", "/a/../b", "/", `\a\b`} {
+	for _, target := range []string{"/a/b", "/", `\a\b`} {
 		if err := f.Symlink(target, "/l"); err != nil || !strings.HasPrefix(lfs.gotOld, `C:\root`) {
 			t.Errorf("Symlink(%q, /l) stored %q, %v", target, lfs.gotOld, err)
 		}
@@ -262,7 +266,12 @@ func TestSymlinkWindowsRules(t *testing.T) {
 			t.Errorf("Readlink after Symlink(%q) = %q, %v (stored %q)", target, got, err, lfs.gotOld)
 		}
 	}
-	for _, c := range [][2]string{{`C:\x`, "/l"}, {`\\srv\share`, "/l"}, {`..\..\x`, `sub\l`}, {"/a", `C:\l`}} {
+	bad := [][2]string{
+		{`C:\x`, "/l"}, {`\\srv\share`, "/l"}, {`..\..\x`, `sub\l`}, {"/a", `C:\l`},
+		// An absolute target must be clean.
+		{"/a/./b/", "/l"}, {"/a/../b", "/l"}, {`\a\..\b`, "/l"}, {`\a\`, "/l"},
+	}
+	for _, c := range bad {
 		err := f.Symlink(c[0], c[1])
 		var le *os.LinkError
 		if !errors.Is(err, ErrPathEscapes) || !errors.As(err, &le) || le.Old != c[0] || le.New != c[1] {

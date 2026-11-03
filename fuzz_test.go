@@ -218,6 +218,8 @@ func FuzzSymlinkOperations(f *testing.F) {
 	f.Add("safe", "../../root/.ssh")
 	f.Add("symlink", "/absolute/target")
 	f.Add("symlink", "/sub/../inside.txt")
+	f.Add("symlink", "/sub/./deep//f.txt")
+	f.Add("/a/b/l", "/a/../../secret")
 	f.Add("user/link", `..\..\windows`)
 	f.Add("/l", "/")
 	f.Add("/l", "")
@@ -232,9 +234,8 @@ func FuzzSymlinkOperations(f *testing.F) {
 			got, rerr := p.readlink(link)
 			if err == nil && target != "" {
 				want := filepath.ToSlash(target)
-				if path.IsAbs(want) {
-					// Windows hosts store absolute targets cleaned.
-					want = winClean(p.e, want)
+				if path.IsAbs(want) && path.Clean(want) != want {
+					t.Errorf("%s: Symlink(%q, %q) accepted an absolute target that is not clean", p.e.name, target, link)
 				}
 				if rerr != nil || filepath.ToSlash(got) != want {
 					t.Errorf("%s: Readlink(%q) = %q, %v after Symlink(%q)", p.e.name, link, got, rerr, target)

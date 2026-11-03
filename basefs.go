@@ -24,15 +24,16 @@
 // Symlink stores a relative target verbatim, and an absolute target as the
 // root's host path followed by the target, so Readlink returns exactly the
 // text given to Symlink, as POSIX tools expect. It refuses a target that,
-// resolved lexically from the link's directory, would climb above the root.
-// That check is made on names, once, at creation. basefs cannot stop the
-// host from following a link physically, so a link that was inside the root
-// when made can lead out of it when the host follows it later:
+// resolved lexically from the link's directory, would climb above the root,
+// and an absolute target that is not clean ("/a/../b"). That check is made
+// on names, once, at creation. basefs cannot stop the host from following a
+// link physically, so a link that was inside the root when made can lead out
+// of it when the host follows it later:
 //
 //   - a relative link such as "../f", moved by Rename (or carried by a Rename
 //     of a directory holding it) somewhere shallower, now climbs further;
-//   - a target such as "l/../f", where l is itself a symlink, is resolved by
-//     the host through wherever l points, not lexically;
+//   - a relative target such as "l/../f", where l is itself a symlink, is
+//     resolved by the host through wherever l points, not lexically;
 //   - a link created beneath a symlinked directory is resolved by the host
 //     from the directory it actually lands in.
 //
@@ -60,7 +61,8 @@ import (
 
 // ErrPathEscapes is the error (wrapped in an *os.PathError or *os.LinkError)
 // returned when a name, symlink target, or symlink content would resolve to a
-// location outside the basefs root.
+// location outside the basefs root, or, for an absolute symlink target that
+// is not clean, could do so when the host follows it.
 var ErrPathEscapes = errors.New("path escapes from base directory")
 
 // windowsPaths enables Windows path rules (backslash separators, volume
@@ -511,13 +513,16 @@ func (f *SymlinkFileSystem) Lchown(name string, uid, gid int) error {
 // Readlink returns the target of the symlink name.
 //
 // A relative target is returned exactly as stored; it is relative to the
-// link's directory. An absolute target on or below the root's host path is
-// returned as an absolute virtual path: the root is removed and the rest is
-// returned as written, so Readlink(l) after Symlink(t, l) returns t. (If the
-// rest, as written, would climb above the root, the cleaned virtual path is
-// returned instead.) An absolute target outside the root has no virtual
-// equivalent and is never revealed: Readlink returns an *os.PathError
-// wrapping ErrPathEscapes.
+// link's directory. An absolute target is returned as an absolute virtual
+// path: the root's host path is removed from the front and the rest is
+// returned as written, so Readlink(l) after Symlink(t, l) returns t. The
+// judgement is lexical and made on the target as written, not cleaned: a
+// target that does not start with the root's host path on a separator
+// boundary, or whose rest would climb above the root, has no virtual
+// equivalent and is never revealed. Readlink returns an *os.PathError
+// wrapping ErrPathEscapes for it. That includes a detour such as
+// <parent>/xfoo/../x/f for a root of <parent>/x, and, on Windows, a rooted
+// target without a volume (\Windows) or on another volume.
 func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
 	_, hpath, err := f.path("readlink", name)
 	if err != nil {
@@ -529,20 +534,20 @@ func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
 	}
 
 	// Relative symlinks are relative to the link location, not the root.
-	if !path.IsAbs(target) && !filepath.IsAbs(target) && !(windowsPaths && hasVolume(target)) {
+	// toSlash makes a rooted Windows target such as \Windows absolute here,
+	// as it is in Symlink.
+	if !path.IsAbs(toSlash(target)) && !(windowsPaths && hasVolume(target)) {
 		return target, nil
 	}
-	vpath, ok := relTo(f.prefix, target)
+	// The target, as written, must lie on or below the root and must not
+	// climb above it from there; it is not cleaned first, so a detour such
+	// as <parent>/xfoo/../x/f is refused rather than read as /f.
+	vpath, ok := verbatimRel(f.prefix, target)
+	if ok {
+		_, ok = cleanVirtual(vpath)
+	}
 	if !ok {
 		return "", &os.PathError{Op: "readlink", Path: name, Err: ErrPathEscapes}
-	}
-	// Prefer the target as written ("..", "." and doubled or trailing
-	// slashes intact), so a link made by Symlink reads back as the text it
-	// was given, provided it reads lexically as a path inside the root.
-	if v, ok := verbatimRel(f.prefix, target); ok {
-		if _, ok := cleanVirtual(v); ok {
-			return v, nil
-		}
 	}
 	return vpath, nil
 }
@@ -578,28 +583,34 @@ func verbatimRel(root, host string) (string, bool) {
 // Readlink of the new link returns oldname unchanged. What is stored on the
 // underlying filesystem is:
 //
-//   - for a relative oldname ("f", "../f"), oldname itself, byte for byte;
+//   - for a relative oldname ("f", "../f"), oldname itself;
 //   - for an absolute oldname ("/a/f"), the root's host path followed by
 //     oldname, so the host resolves it inside the root. A program that reads
 //     the link directly from the underlying filesystem, bypassing basefs,
 //     sees that host path (for example "/srv/data/a/f" for a root of
 //     /srv/data), and the link breaks if the root directory itself is moved
-//     on the host. On Windows an absolute oldname reads back with forward
-//     slashes, and cleaned, because the host itself stores absolute targets
-//     cleaned ("/a/../b" reads back as "/b").
+//     on the host.
+//
+// On Windows, through osfs, the host stores targets with backslashes and
+// they read back with forward slashes, relative ones included: "..\x" reads
+// back as "../x".
 //
 // At creation, oldname is checked lexically: a relative oldname is joined to
 // the directory of newname, and ".." elements are applied to the name
 // without following any symlink. If the result would climb above the root,
 // Symlink returns an *os.LinkError wrapping ErrPathEscapes and creates
-// nothing. On Windows, an oldname carrying a volume is rejected the same way.
+// nothing. An absolute oldname must also be clean, as path.Clean leaves it:
+// "/a/../b", "/a/./b", "//a" and "/a/" are refused the same way, because the
+// host would apply ".." physically, through any symlink before it, and
+// because Windows stores absolute targets cleaned, so they could not read
+// back as written. On Windows, an oldname carrying a volume is refused too.
 //
 // That check concerns names, at creation time. The host follows a stored
 // link physically, so a link that named a place inside the root when it was
 // made can resolve outside it later: a relative link moved by Rename (or
-// inside a directory moved by Rename) somewhere shallower, or a target whose
-// ".." follows an element that is itself a symlink. See the package
-// documentation.
+// inside a directory moved by Rename) somewhere shallower, or a relative
+// target whose ".." follows an element that is itself a symlink. See the
+// package documentation.
 func (f *SymlinkFileSystem) Symlink(oldname, newname string) error {
 	vlink, hlink, err := f.path("symlink", newname)
 	if err != nil {
@@ -616,7 +627,12 @@ func (f *SymlinkFileSystem) Symlink(oldname, newname string) error {
 	if !abs {
 		resolved = path.Dir(vlink) + "/" + target
 	}
-	if _, ok := cleanVirtual(resolved); !ok || (windowsPaths && hasVolume(oldname)) {
+	_, ok := cleanVirtual(resolved)
+	// An absolute target must be clean. The host applies ".." physically,
+	// through any symlink before it ("/l/../f" with l a link to "/" leaves
+	// the root), and Windows stores absolute targets cleaned, so anything
+	// else could not read back as written.
+	if !ok || (abs && path.Clean(target) != target) || (windowsPaths && hasVolume(oldname)) {
 		return &os.LinkError{Op: "symlink", Old: oldname, New: newname, Err: ErrPathEscapes}
 	}
 	stored := oldname
