@@ -19,15 +19,17 @@ Names are resolved lexically:
 
 An absolute host path is just a name inside the root: with a root of `/srv/data`, the name `/etc/passwd` means `/srv/data/etc/passwd`.
 
-On Windows, `\` is a separator as well as `/`. Names carrying a volume (`C:\x`, `c:x`, `\\server\share`, `\\?\C:\x`) and reserved device names (`NUL`, `CON`, ...) are rejected with `ErrPathEscapes`. Native (`C:\data`) and osfs-style (`/c/data`) roots are both accepted.
+On Windows, `\` is a separator as well as `/`. Names carrying a volume (`C:\x`, `c:x`, `\\server\share`, `\\?\C:\x`), names containing a colon anywhere (such as the alternate data stream `file:stream`), and names with an element that is a reserved device name (`NUL`, `CON`, `COM1`, `CONIN$`, ... in any case, with or without trailing dots or spaces) are rejected with `ErrPathEscapes`. Native (`C:\data`) and osfs-style (`/c/data`) roots are both accepted.
 
 ### Symbolic links
 
 basefs constrains **names**, not what the underlying filesystem does with them. When the underlying filesystem follows symlinks, as `osfs` does through the host OS, a link inside the root whose target lies outside it is followed out of the root. basefs does the following:
 
-- `Symlink` refuses to create a link whose target resolves outside the root, lexically from the link's directory. An absolute target is a virtual path and is stored as the matching path under the root.
-- `Readlink` returns a relative target unchanged and maps an absolute target inside the root back to a virtual path. It never reveals an absolute target outside the root: it returns `ErrPathEscapes` instead.
-- A link placed by another process, or replaced between a check and a use, is still followed by the host. If the tree may contain untrusted links, use an OS-level mechanism (`os.Root`, a chroot, or a container).
+- `Symlink` resolves the target to a virtual path, joining a relative target to the link's directory and resolving `..` lexically (so `l/../f` is `f` beside `l`, wherever `l` points). A target that would climb above the root is rejected with `ErrPathEscapes`.
+- The stored target never contains `..`. A relative target that stays within the link's directory (`f`, `sub/f`) is stored cleaned and relative. An absolute target, or a relative one that climbs (`../f`), is stored as the absolute host path under the root. A stored relative target only descends from wherever the link is, and a stored absolute one names a fixed place under the root, so neither `Rename` of the link or of a directory above it, nor creating it beneath a symlinked directory, can make a link created by basefs point outside the root.
+- `Readlink` returns a relative target unchanged and maps an absolute target inside the root back to a virtual path. A climbing target such as `../f` therefore reads back as an absolute virtual path (`/f`), not as the text passed to `Symlink`. `Readlink` never reveals an absolute target outside the root: it returns `ErrPathEscapes` instead.
+- Links stored as absolute host paths break if the root directory itself is moved on the host.
+- A link placed by another process, or replaced between a check and a use, is still followed by the host. If the tree may contain links that basefs did not create, use an OS-level mechanism (`os.Root`, a chroot, or a container).
 
 ### Other methods
 

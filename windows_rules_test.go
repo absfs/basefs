@@ -55,6 +55,9 @@ func TestVirtualWindowsRules(t *testing.T) {
 		`\sub\deep\`:      `/sub/deep`,
 		`/mixed\sep/file`: `/mixed/sep/file`,
 		`C`:               `/sub/C`,
+		`CONSOLE`:         `/sub/CONSOLE`,
+		`COM0`:            `/sub/COM0`,
+		`LPTX`:            `/sub/LPTX`,
 	}
 	for name, want := range ok {
 		got, valid := b.virtual(name)
@@ -66,6 +69,11 @@ func TestVirtualWindowsRules(t *testing.T) {
 		`..\..\x`, `\..\x`, `deep\..\..\..\x`,
 		`C:\x`, `c:x`, `C:`, `D:/x`,
 		`\\server\share\x`, `//server/share/x`, `\\?\C:\root\x`, `\\.\C:\root`,
+		// Reserved device names, in any element, any case, with trailing
+		// dots or spaces, and any name holding a colon (alternate data
+		// streams).
+		`NUL`, `nul`, `deep\CON`, `aux\f`, `PRN.`, `com1 `, `LPT9`,
+		`CONIN$`, `conout$`, `file:stream`, `deep\f::$DATA`,
 	}
 	for _, name := range escapes {
 		if got, valid := b.virtual(name); valid {
@@ -230,8 +238,13 @@ func TestSymlinkWindowsRules(t *testing.T) {
 	if err := f.Symlink("/a", "/l"); err != nil || lfs.gotOld != `C:\root\a` || lfs.gotNew != `C:\root\l` {
 		t.Errorf("Symlink(/a, /l) stored (%q, %q), %v", lfs.gotOld, lfs.gotNew, err)
 	}
-	if err := f.Symlink(`..\x`, `sub\l`); err != nil || lfs.gotOld != "../x" || lfs.gotNew != `C:\root\sub\l` {
+	// A climbing relative target is stored absolute; a descending one stays
+	// relative, cleaned, with forward slashes.
+	if err := f.Symlink(`..\x`, `sub\l`); err != nil || lfs.gotOld != `C:\root\x` || lfs.gotNew != `C:\root\sub\l` {
 		t.Errorf(`Symlink(..\x, sub\l) stored (%q, %q), %v`, lfs.gotOld, lfs.gotNew, err)
+	}
+	if err := f.Symlink(`d\..\x\`, `sub\l`); err != nil || lfs.gotOld != "x" {
+		t.Errorf(`Symlink(d\..\x\, sub\l) stored %q, %v`, lfs.gotOld, err)
 	}
 	for _, c := range [][2]string{{`C:\x`, "/l"}, {`\\srv\share`, "/l"}, {`..\..\x`, `sub\l`}, {"/a", `C:\l`}} {
 		err := f.Symlink(c[0], c[1])

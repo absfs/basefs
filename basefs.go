@@ -10,18 +10,26 @@
 // A root of /d/x therefore never reaches a sibling such as /d/xfoo.
 //
 // On Windows, backslashes in names are treated as separators, and names that
-// carry a volume (C:\x, c:x, \\server\share, \\?\C:\x) or a reserved device
-// name (CON, NUL, ...) are rejected with ErrPathEscapes.
+// carry a volume (C:\x, c:x, \\server\share, \\?\C:\x), contain a colon
+// (f:stream), or have an element that is a reserved device name (CON, NUL,
+// ...) are rejected with ErrPathEscapes.
 //
 // What basefs guarantees is limited to names: it never hands the underlying
 // filesystem a path outside the root. It does not control what the
 // underlying filesystem does with that path. In particular, when the
 // underlying filesystem follows symbolic links (as osfs does, through the
 // host OS), a link inside the root whose target lies outside it is followed
-// out of the root. basefs refuses to create such links through Symlink, and
-// Readlink never reports a host path outside the root, but a link placed by
-// another process is still followed by the host. Use an OS-level mechanism
-// (os.Root, a chroot, a container) when the tree may contain untrusted links.
+// out of the root.
+//
+// Links created through Symlink cannot be made to do that. Their targets are
+// checked against the root and stored without any ".." (see Symlink), so
+// neither a later Rename of the link or of a directory above it, nor a
+// symlinked directory it is created beneath, can make them point outside
+// the root. Readlink never
+// reports a host path outside the root. A link placed by another process,
+// however, is followed by the host wherever it points. Use an OS-level
+// mechanism (os.Root, a chroot, a container) when the tree may contain links
+// that basefs did not create.
 //
 // Errors report the caller's names, never the underlying host paths.
 package basefs
@@ -125,14 +133,44 @@ func cleanVirtual(p string) (string, bool) {
 	if rel == ".." || strings.HasPrefix(rel, "../") {
 		return "", false
 	}
-	if runtime.GOOS == "windows" && rel != "." && !filepath.IsLocal(rel) {
-		// Reserved device names (CON, NUL, ...) and other non-local forms.
-		return "", false
-	}
 	if rel == "." {
 		return "/", true
 	}
+	if windowsPaths && !windowsLocal(rel) {
+		return "", false
+	}
 	return "/" + rel, true
+}
+
+// windowsLocal reports whether rel, a clean slash-separated relative path,
+// names an ordinary file under Windows rules: it contains no ':' (a drive
+// letter or an alternate data stream such as "f:stream") and no element that
+// is a reserved device name. On Windows itself filepath.IsLocal has the last
+// word, since some Windows versions also reserve names such as "NUL.txt".
+func windowsLocal(rel string) bool {
+	if strings.Contains(rel, ":") {
+		return false
+	}
+	for _, elem := range strings.Split(rel, "/") {
+		if isReservedName(elem) {
+			return false
+		}
+	}
+	return runtime.GOOS != "windows" || filepath.IsLocal(rel)
+}
+
+// isReservedName reports whether elem is a Windows reserved device name,
+// ignoring case and trailing dots and spaces, which Windows strips.
+func isReservedName(elem string) bool {
+	base := strings.ToUpper(strings.TrimRight(elem, ". "))
+	switch base {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
+		return true
+	}
+	if len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) {
+		return base[3] >= '1' && base[3] <= '9'
+	}
+	return false
 }
 
 // baseFS contains the implementation shared by FileSystem and SymlinkFileSystem.
@@ -489,33 +527,48 @@ func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
 
 // Symlink creates newname as a symbolic link to oldname.
 //
-// An absolute oldname is a virtual path and is stored as the corresponding
-// path under the root. A relative oldname is stored unchanged. Either way the
-// target must resolve, lexically from the link's directory, to a location
-// inside the root; otherwise Symlink returns an *os.LinkError wrapping
-// ErrPathEscapes and creates nothing.
+// oldname is resolved to a virtual path: an absolute oldname is taken as is,
+// a relative one is joined to the directory of newname. ".." elements are
+// resolved lexically, before any symlink is followed, so "l/../f" names f
+// beside l whatever l points to. If the result would climb above the root,
+// Symlink returns an *os.LinkError wrapping ErrPathEscapes and creates
+// nothing.
+//
+// The target stored in the link never contains "..", so the link cannot be
+// made to point outside the root by moving it, or a directory above it, with
+// Rename, or by creating it beneath a symlinked directory:
+//
+//   - A relative oldname that does not climb out of the link's directory
+//     once cleaned ("f", "sub/f", "l/../f") is stored cleaned and relative.
+//     It only descends from wherever the link is.
+//   - An absolute oldname, or a relative one that climbs ("../f"), is stored
+//     as the absolute host path of its virtual target. Readlink reports it
+//     as an absolute virtual path ("/f"), not as the text passed in, and the
+//     link breaks if the root itself is moved on the host.
 func (f *SymlinkFileSystem) Symlink(oldname, newname string) error {
 	vlink, hlink, err := f.path("symlink", newname)
 	if err != nil {
 		return f.fixLinkErr("symlink", oldname, newname, err)
 	}
+	if oldname == "" {
+		// No target to resolve; let the underlying filesystem decide.
+		return f.fixLinkErr("symlink", oldname, newname, f.sfs.Symlink("", hlink))
+	}
 
 	target := toSlash(oldname)
-	escapes := windowsPaths && hasVolume(oldname)
-	if !escapes {
-		var vtarget string
-		var ok bool
-		if path.IsAbs(target) {
-			if vtarget, ok = cleanVirtual(target); ok {
-				target = f.host(vtarget)
-			}
-		} else {
-			_, ok = cleanVirtual(path.Dir(vlink) + "/" + target)
-		}
-		escapes = !ok
+	rel := !path.IsAbs(target)
+	if rel {
+		target = path.Clean(target)
 	}
-	if escapes {
+	vtarget, ok := cleanVirtual(target)
+	if rel {
+		vtarget, ok = cleanVirtual(path.Dir(vlink) + "/" + target)
+	}
+	if !ok || (windowsPaths && hasVolume(oldname)) {
 		return &os.LinkError{Op: "symlink", Old: oldname, New: newname, Err: ErrPathEscapes}
+	}
+	if !rel || target == ".." || strings.HasPrefix(target, "../") {
+		target = f.host(vtarget)
 	}
 	return f.fixLinkErr("symlink", oldname, newname, f.sfs.Symlink(target, hlink))
 }

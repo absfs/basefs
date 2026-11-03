@@ -1,77 +1,255 @@
 package basefs_test
 
 import (
+	"errors"
+	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/absfs/basefs"
-	"github.com/absfs/osfs"
 )
 
-// FuzzPathValidation tests that basefs properly prevents escaping the base directory
-// with various attack vectors including path traversal, absolute paths, null bytes, etc.
+// The fuzz targets run every operation against a root parent/x that sits
+// beside parent/xfoo/secret ("SECRET") and parent/secret ("PARENT"), on both
+// osfs and memfs (see env). For any input they require that no read returns
+// either secret, that nothing outside the root changes, and that no error
+// reveals the host parent path.
+
+var nameSeeds = []string{
+	"../xfoo/secret",
+	"../xfoo/secret/",
+	"../x/../xfoo/secret",
+	"/../secret",
+	"sub/../../xfoo/secret",
+	"../etc/passwd",
+	`..\windows\system32`,
+	`..\xfoo\secret`,
+	"/absolute/path",
+	"foo/../../etc/passwd",
+	"./././../etc/passwd",
+	"\x00hidden/file",
+	"normal/path",
+	"inside.txt",
+	"sub/deep/f.txt",
+	"",
+	"/",
+	".",
+	strings.Repeat("../", 12) + "etc/shadow",
+	`\\network\share`,
+	`C:\Windows`,
+	"c:secret",
+	"NUL",
+	"symlink/../../../etc/passwd",
+	"./../.../../etc/passwd",
+}
+
+type fuzzProbe struct {
+	t *testing.T
+	e *env
+	b *basefs.SymlinkFileSystem
+}
+
+// fuzzEnvs runs fn once per underlying filesystem with a fresh environment
+// and checks afterwards that nothing outside the root changed.
+func fuzzEnvs(t *testing.T, fn func(p *fuzzProbe)) {
+	for _, e := range envs(t) {
+		before := e.outsideSnapshot(t)
+		fn(&fuzzProbe{t: t, e: e, b: e.symlinkFS(t)})
+		if after := e.outsideSnapshot(t); after != before {
+			t.Fatalf("%s: outside of root changed:\nbefore\n%s\nafter\n%s", e.name, before, after)
+		}
+	}
+}
+
+// err fails if err reveals the host parent. The names in a PathError or
+// LinkError are the caller's own, so only the wrapped error is inspected.
+func (p *fuzzProbe) err(op string, err error) {
+	if err == nil {
+		return
+	}
+	inner := err
+	var pe *os.PathError
+	var le *os.LinkError
+	switch {
+	case errors.As(err, &pe):
+		inner = pe.Err
+	case errors.As(err, &le):
+		inner = le.Err
+	}
+	msg := inner.Error()
+	if strings.Contains(msg, p.e.parent) || strings.Contains(msg, filepath.ToSlash(p.e.parent)) {
+		p.t.Errorf("%s: %s error leaks host path: %v", p.e.name, op, err)
+	}
+}
+
+// read fails if data came from outside the root.
+func (p *fuzzProbe) read(op, name string) {
+	data, err := p.b.ReadFile(name)
+	p.err(op+" ReadFile", err)
+	if s := string(data); s == "SECRET" || s == "PARENT" {
+		p.t.Errorf("%s: %s ReadFile(%q) read outside the root: %q", p.e.name, op, name, s)
+	}
+	f, err := p.b.Open(name)
+	p.err(op+" Open", err)
+	if err == nil {
+		data, _ := io.ReadAll(f)
+		_ = f.Close()
+		if s := string(data); s == "SECRET" || s == "PARENT" {
+			p.t.Errorf("%s: %s Open(%q) read outside the root: %q", p.e.name, op, name, s)
+		}
+	}
+}
+
+// write truncates and writes through name; the outside snapshot catches any
+// write that lands outside the root.
+func (p *fuzzProbe) write(name string) {
+	f, err := p.b.OpenFile(name, os.O_WRONLY|os.O_TRUNC, 0)
+	p.err("OpenFile", err)
+	if err == nil {
+		_, _ = f.Write([]byte("PWNED"))
+		_ = f.Close()
+	}
+}
+
+// virtualOK fails unless v is a clean virtual path.
+func (p *fuzzProbe) virtualOK(op, v string) {
+	if !strings.HasPrefix(v, "/") || path.Clean(v) != v || strings.Contains(v, p.e.parent) {
+		p.t.Errorf("%s: %s returned %q, not a clean virtual path", p.e.name, op, v)
+	}
+}
+
+// readlink fails if a link target holds ".." or the host parent.
+func (p *fuzzProbe) readlink(name string) {
+	got, err := p.b.Readlink(name)
+	p.err("Readlink", err)
+	for _, elem := range strings.Split(filepath.ToSlash(got), "/") {
+		if elem == ".." {
+			p.t.Errorf("%s: Readlink(%q) = %q, holds ..", p.e.name, name, got)
+		}
+	}
+	if strings.Contains(got, p.e.parent) {
+		p.t.Errorf("%s: Readlink(%q) = %q leaks host path", p.e.name, name, got)
+	}
+}
+
+// FuzzPathValidation runs every path-taking method on one name.
 func FuzzPathValidation(f *testing.F) {
-	// Seed corpus with known attack patterns
-	f.Add("/base", "../etc/passwd")
-	f.Add("/base", "..\\windows\\system32")
-	f.Add("/base", "/absolute/path")
-	f.Add("/base", "foo/../../etc/passwd")
-	f.Add("/base", "./././../etc/passwd")
-	f.Add("/tmp", "\x00hidden/file")
-	f.Add("/tmp", "normal/path")
-	f.Add("/var", "../../../../../../etc/shadow")
-	f.Add("/home", "user/../../../root/.ssh/id_rsa")
-	f.Add("/opt", "\\\\network\\share")
-	f.Add("/usr", "local/bin/../../../etc/passwd")
-	f.Add("/tmp", "a/b/c/../../../../../../../../etc/passwd")
-	f.Add("/base", "..\\..\\..\\windows\\system32\\config\\sam")
-	f.Add("/tmp", "symlink/../../../etc/passwd")
-	f.Add("/var", "./../.../../etc/passwd")
+	for _, s := range nameSeeds {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, name string) {
+		fuzzEnvs(t, func(p *fuzzProbe) {
+			b := p.b
+			ignore := func(_ interface{}, err error) error { return err }
+			p.read("initial", name)
+			p.readlink(name)
+			p.err("Stat", ignore(b.Stat(name)))
+			p.err("Lstat", ignore(b.Lstat(name)))
+			p.err("ReadDir", ignore(b.ReadDir(name)))
+			p.err("Sub", ignore(b.Sub(name)))
+			p.err("Chmod", b.Chmod(name, 0o755))
+			p.err("Chown", b.Chown(name, os.Getuid(), os.Getgid()))
+			p.err("Lchown", b.Lchown(name, os.Getuid(), os.Getgid()))
+			p.err("Chtimes", b.Chtimes(name, time.Unix(1, 0), time.Unix(1, 0)))
+			if err := b.Chdir(name); err == nil {
+				wd, _ := b.Getwd()
+				p.virtualOK("Getwd", wd)
+				p.read("after Chdir", "../xfoo/secret")
+				_ = b.Chdir("/")
+			} else {
+				p.err("Chdir", err)
+			}
+			p.write(name)
+			p.err("Truncate", b.Truncate(name, 0))
+			if fh, err := b.Create(name); err == nil {
+				_ = fh.Close()
+			} else {
+				p.err("Create", err)
+			}
+			p.err("Mkdir", b.Mkdir(name, 0o755))
+			p.err("MkdirAll", b.MkdirAll(name, 0o755))
+			p.err("Remove", b.Remove(name))
+			p.err("RemoveAll", b.RemoveAll(name))
+		})
+	})
+}
 
-	f.Fuzz(func(t *testing.T, base, path string) {
-		// Skip empty base paths
-		if base == "" {
-			return
-		}
+// FuzzDirectoryRestriction moves entries between a name and another name,
+// then tries to read and write through both.
+func FuzzDirectoryRestriction(f *testing.F) {
+	f.Add("inside.txt", "../xfoo/secret")
+	f.Add("sub", "../xfoo")
+	f.Add("../xfoo/secret", "stolen")
+	f.Add("../secret", "stolen")
+	f.Add("good.txt", "../../etc/passwd")
+	f.Add("data/file", "../../../../root/.ssh/id_rsa")
+	f.Add("user/doc.txt", `..\..\windows\system32`)
+	f.Add("app/config", "/absolute/path")
+	f.Add("local/bin", "\x00hidden")
+	f.Add("normal", "symlink/../../../etc/passwd")
+	f.Add("a/b/c", "../../../../../../../../etc/shadow")
+	f.Fuzz(func(t *testing.T, a, b string) {
+		fuzzEnvs(t, func(p *fuzzProbe) {
+			p.err("Rename", p.b.Rename(a, b))
+			p.read("after Rename", b)
+			p.err("Rename back", p.b.Rename(b, a))
+			p.read("after Rename back", a)
+			p.write(a)
+			p.write(b)
+			p.err("MkdirAll", p.b.MkdirAll(b, 0o755))
+			p.err("RemoveAll", p.b.RemoveAll(b))
+		})
+	})
+}
 
-		// Ensure base is an absolute path for NewFS to accept it
-		if !filepath.IsAbs(base) {
-			return
-		}
-
-		// Create a temp directory to use as the actual base
-		tempDir := t.TempDir()
-
-		// Create the underlying filesystem
-		ofs, err := osfs.NewFS()
-		if err != nil {
-			t.Skipf("Failed to create osfs: %v", err)
-		}
-
-		// Create basefs with the temp directory as base
-		fs, err := basefs.NewFS(ofs, tempDir)
-		if err != nil {
-			return // Invalid base is ok to skip
-		}
-
-		// All of these operations should never panic, regardless of input
-		// The filesystem should handle malicious paths gracefully
-		_, _ = fs.Open(path)
-		_, _ = fs.Stat(path)
-		_, _ = fs.OpenFile(path, os.O_RDONLY, 0644)
-		_, _ = fs.Lstat(path)
-		_, _ = fs.Create(path)
-
-		// Directory operations should also not panic
-		_ = fs.Mkdir(path, 0755)
-		_ = fs.MkdirAll(path, 0755)
-		_ = fs.Remove(path)
-		_ = fs.RemoveAll(path)
-
-		// These operations should not panic even with malicious paths
-		_ = fs.Chmod(path, 0644)
-		_ = fs.Chown(path, 0, 0)
+// FuzzSymlinkOperations creates a link with an arbitrary target and name
+// beside links to the root and to "..", then rearranges it with Rename. No
+// combination may yield a link that reads or writes outside the root.
+func FuzzSymlinkOperations(f *testing.F) {
+	f.Add("link", "../../../etc/passwd")
+	f.Add("/a/l", "../xfoo/secret")
+	f.Add("/a/b/l", "../../xfoo/secret")
+	f.Add("/a/b/evil", "l/../xfoo/secret")
+	f.Add("/a/b/l/evil", "../xfoo/secret")
+	f.Add("/a/evil", "up/../secret")
+	f.Add("/a/b/l/sub/deep/evil", "../../../secret")
+	f.Add("safe", "../../root/.ssh")
+	f.Add("symlink", "/absolute/target")
+	f.Add("user/link", `..\..\windows`)
+	f.Add("/l", "/")
+	f.Fuzz(func(t *testing.T, link, target string) {
+		fuzzEnvs(t, func(p *fuzzProbe) {
+			b := p.b
+			if err := b.MkdirAll("/a/b", 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := b.Symlink("/", "/a/b/l"); err != nil {
+				t.Fatal(err)
+			}
+			if err := b.Symlink("..", "/a/up"); err != nil {
+				t.Fatal(err)
+			}
+			p.err("Symlink", b.Symlink(target, link))
+			p.readlink(link)
+			p.read("link", link)
+			p.write(link)
+			// Move the link to the root, and the directory holding the
+			// fixed links up a level; neither may change where they point.
+			p.err("Rename", b.Rename(link, "/moved"))
+			p.readlink("/moved")
+			p.read("moved", "/moved")
+			p.write("/moved")
+			p.err("Rename dir", b.Rename("/a/b", "/b"))
+			for _, name := range []string{"/b/l/xfoo/secret", "/a/up/secret", "/b/evil", "/a/evil", "/evil"} {
+				p.read("after dir move", name)
+				p.write(name)
+			}
+			p.err("Lchown", b.Lchown(link, os.Getuid(), os.Getgid()))
+		})
 	})
 }
 
@@ -96,106 +274,5 @@ func FuzzIsAbsPath(f *testing.F) {
 	f.Fuzz(func(t *testing.T, path string) {
 		// Should not panic on any input
 		_ = filepath.IsAbs(path)
-	})
-}
-
-// FuzzDirectoryRestriction tests that all file operations respect the base directory boundary
-// This ensures that operations cannot escape the sandbox through various attack vectors
-func FuzzDirectoryRestriction(f *testing.F) {
-	f.Add("/base", "safe/file.txt", "../escape.txt")
-	f.Add("/tmp", "good.txt", "../../etc/passwd")
-	f.Add("/var", "data/file", "../../../../root/.ssh/id_rsa")
-	f.Add("/home", "user/doc.txt", "..\\..\\windows\\system32")
-	f.Add("/opt", "app/config", "/absolute/path")
-	f.Add("/usr", "local/bin", "\x00hidden")
-	f.Add("/base", "normal", "symlink/../../../etc/passwd")
-	f.Add("/tmp", "a/b/c", "../../../../../../../../etc/shadow")
-
-	f.Fuzz(func(t *testing.T, base, goodPath, badPath string) {
-		// Skip empty base paths
-		if base == "" {
-			return
-		}
-
-		// Ensure base is an absolute path
-		if !filepath.IsAbs(base) {
-			return
-		}
-
-		// Create a temp directory to use as the actual base
-		tempDir := t.TempDir()
-
-		// Create the underlying filesystem
-		ofs, err := osfs.NewFS()
-		if err != nil {
-			t.Skipf("Failed to create osfs: %v", err)
-		}
-
-		// Create basefs with the temp directory as base
-		fs, err := basefs.NewFS(ofs, tempDir)
-		if err != nil {
-			return
-		}
-
-		// Operations on bad paths should fail gracefully without panicking
-		_ = fs.Mkdir(badPath, 0755)
-		_ = fs.MkdirAll(badPath, 0755)
-		_ = fs.Remove(badPath)
-		_ = fs.RemoveAll(badPath)
-		_ = fs.Rename(goodPath, badPath)
-		_ = fs.Rename(badPath, goodPath)
-
-		// File operations should also handle bad paths gracefully
-		_, _ = fs.Open(badPath)
-		_, _ = fs.Create(badPath)
-		_, _ = fs.Stat(badPath)
-		_, _ = fs.OpenFile(badPath, os.O_RDONLY, 0644)
-
-		// Permission and ownership operations
-		_ = fs.Chmod(badPath, 0644)
-		_ = fs.Chown(badPath, 0, 0)
-		_ = fs.Truncate(badPath, 0)
-	})
-}
-
-// FuzzSymlinkOperations tests that symlink operations cannot be used to escape
-// the base directory through symbolic link attacks
-func FuzzSymlinkOperations(f *testing.F) {
-	f.Add("/base", "link", "../../../etc/passwd")
-	f.Add("/tmp", "safe", "../../root/.ssh")
-	f.Add("/var", "symlink", "/absolute/target")
-	f.Add("/home", "user/link", "..\\..\\windows")
-
-	f.Fuzz(func(t *testing.T, base, linkPath, target string) {
-		// Skip empty base paths
-		if base == "" {
-			return
-		}
-
-		// Ensure base is an absolute path
-		if !filepath.IsAbs(base) {
-			return
-		}
-
-		// Create a temp directory to use as the actual base
-		tempDir := t.TempDir()
-
-		// Create the underlying filesystem
-		ofs, err := osfs.NewFS()
-		if err != nil {
-			t.Skipf("Failed to create osfs: %v", err)
-		}
-
-		// Create basefs with the temp directory as base
-		fs, err := basefs.NewFS(ofs, tempDir)
-		if err != nil {
-			return
-		}
-
-		// Symlink operations should not panic and should prevent escaping
-		_ = fs.Symlink(target, linkPath)
-		_, _ = fs.Readlink(linkPath)
-		_, _ = fs.Lstat(linkPath)
-		_ = fs.Lchown(linkPath, 0, 0)
 	})
 }

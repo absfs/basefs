@@ -68,6 +68,28 @@ func (e *env) populate(t *testing.T) {
 // contents, so a test can prove nothing outside the root changed.
 func (e *env) snapshot(t *testing.T) map[string]string {
 	t.Helper()
+	return e.walkParent(t, true)
+}
+
+// outsideSnapshot is a snapshot of everything under parent except the root
+// and its contents, rendered as one comparable string.
+func (e *env) outsideSnapshot(t *testing.T) string {
+	t.Helper()
+	snap := e.walkParent(t, false)
+	keys := make([]string, 0, len(snap))
+	for k := range snap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	for _, k := range keys {
+		fmt.Fprintf(&sb, "%s=%s\n", k, snap[k])
+	}
+	return sb.String()
+}
+
+func (e *env) walkParent(t *testing.T, intoRoot bool) map[string]string {
+	t.Helper()
 	out := map[string]string{}
 	var walk func(dir string)
 	walk = func(dir string) {
@@ -77,6 +99,9 @@ func (e *env) snapshot(t *testing.T) map[string]string {
 		}
 		for _, ent := range entries {
 			p := e.join(dir, ent.Name())
+			if !intoRoot && p == e.root {
+				continue
+			}
 			info, err := e.under.Lstat(p)
 			if err != nil {
 				t.Fatal(err)
@@ -180,6 +205,10 @@ func escapeNames(e *env) []string {
 			`//server/share/x`,
 			`NUL`,
 			`sub/CON`,
+			`sub\aux.`,
+			`CONIN$`,
+			`inside.txt:stream`,
+			`sub\f::$DATA`,
 		)
 		if e.name == "osfs" {
 			sib := filepath.Join(e.parent, "xfoo", "secret")
@@ -528,6 +557,32 @@ func TestSymlinkTargets(t *testing.T) {
 			if got, err := b.Readlink("/l_abs"); err != nil || got != "/inside.txt" {
 				t.Errorf("Readlink(/l_abs) = %q, %v", got, err)
 			}
+			// A climbing relative target is stored absolute, so it cannot be
+			// carried out of the root by moving the link; a descending one
+			// is stored cleaned and relative.
+			for link, want := range map[string]string{
+				"/sub/l_up":       "/inside.txt",
+				"/sub/deep/l_up2": "/inside.txt",
+				"/l_rel":          "inside.txt",
+				"/sub/l_down":     "deep/f.txt",
+			} {
+				if got, err := b.Readlink(link); err != nil || got != want {
+					t.Errorf("Readlink(%q) = %q, %v; want %q", link, got, err, want)
+				}
+			}
+			raw, err = e.under.Readlink(e.join(e.root, "sub", "l_up"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rel, inside := hostRel(e, raw); !inside || rel != "/inside.txt" {
+				t.Errorf("climbing target stored as %q, want the absolute host path", raw)
+			}
+			if err := b.Symlink("deep/../deep/./f.txt", "/sub/l_messy"); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := b.Readlink("/sub/l_messy"); err != nil || got != "deep/f.txt" {
+				t.Errorf("Readlink(/sub/l_messy) = %q, %v; want the cleaned target", got, err)
+			}
 
 			bad := []struct{ target, link string }{
 				{"../../xfoo/secret", "/sub/l_bad"},
@@ -557,6 +612,17 @@ func TestSymlinkTargets(t *testing.T) {
 			}
 			if err := b.Symlink("../../../x/inside.txt", "l_cwd_bad"); !errors.Is(err, basefs.ErrPathEscapes) {
 				t.Errorf("Symlink escaping from cwd = %v", err)
+			}
+
+			// An empty target is passed through; the host decides. Either
+			// way nothing outside the root is named or revealed.
+			if err := b.Symlink("", "/l_empty"); err != nil {
+				var le *os.LinkError
+				if !errors.As(err, &le) || le.Old != "" || le.New != "/l_empty" || strings.Contains(err.Error(), e.parent) {
+					t.Errorf("Symlink(\"\", /l_empty) = %#v", err)
+				}
+			} else if got, err := b.Readlink("/l_empty"); err != nil || got != "" {
+				t.Errorf("Readlink(/l_empty) = %q, %v", got, err)
 			}
 
 			// An existing link name is reported with the caller's names.
@@ -780,12 +846,18 @@ func TestErrorsReportCallerNames(t *testing.T) {
 				{"/missing", ignore(b.ReadDir("/missing"))},
 				{"/missing", b.Remove("/missing")},
 				{"/sub", b.Mkdir("/sub", 0o755)},
-				{"/inside.txt/x", b.MkdirAll("/inside.txt/x", 0o755)},
 				{"/missing", b.Chmod("/missing", 0o644)},
 				{"/missing", b.Chtimes("/missing", time.Now(), time.Now())},
 				{"/missing", b.Truncate("/missing", 0)},
 				{"/missing", ignore(b.Readlink("/missing"))},
 				{"/missing", b.Chdir("/missing")},
+			}
+			if e.name == "osfs" {
+				// memfs.MkdirAll does not fail over an existing file.
+				cases = append(cases, struct {
+					name string
+					err  error
+				}{"/inside.txt/x", b.MkdirAll("/inside.txt/x", 0o755)})
 			}
 			if runtime.GOOS != "windows" {
 				cases = append(cases,
@@ -802,7 +874,7 @@ func TestErrorsReportCallerNames(t *testing.T) {
 			for i, c := range cases {
 				var pe *os.PathError
 				if c.err == nil {
-					// memfs does not fail every one of these; nothing to leak.
+					t.Errorf("%d: operation on %q unexpectedly succeeded", i, c.name)
 					continue
 				}
 				if !errors.As(c.err, &pe) || pe.Path != c.name {
@@ -984,5 +1056,72 @@ func TestErrorScrubbing(t *testing.T) {
 	var pe *os.PathError
 	if !errors.As(errs[4], &pe) || pe.Path != "/a" {
 		t.Errorf("Chmod err = %#v", errs[4])
+	}
+}
+
+// TestSymlinkCannotBeMadeToEscape builds links through basefs alone and then
+// rearranges them (Rename, links through links, links under symlinked
+// parents). None may ever read or write outside the root.
+func TestSymlinkCannotBeMadeToEscape(t *testing.T) {
+	type step func(b *basefs.SymlinkFileSystem) error
+	mkdir := func(p string) step { return func(b *basefs.SymlinkFileSystem) error { return b.MkdirAll(p, 0o755) } }
+	link := func(target, name string) step {
+		return func(b *basefs.SymlinkFileSystem) error { return b.Symlink(target, name) }
+	}
+	rename := func(o, n string) step { return func(b *basefs.SymlinkFileSystem) error { return b.Rename(o, n) } }
+	cases := []struct {
+		name  string
+		steps []step
+		probe []string // names that must not reach outside the root
+	}{
+		{"rename link shallower", []step{
+			mkdir("/a"), link("../xfoo/secret", "/a/l"), rename("/a/l", "/l"),
+		}, []string{"/l"}},
+		{"rename dir holding link", []step{
+			mkdir("/a/b"), link("../../xfoo/secret", "/a/b/l"), rename("/a/b", "/b"),
+		}, []string{"/b/l"}},
+		{"target through link to root", []step{
+			mkdir("/a/b"), link("/", "/a/b/l"), link("l/../xfoo/secret", "/a/b/evil"),
+		}, []string{"/a/b/evil"}},
+		{"target through link to dotdot", []step{
+			mkdir("/a"), link("..", "/a/up"), link("up/../xfoo/secret", "/a/evil"),
+			link("up/../secret", "/a/evil2"),
+		}, []string{"/a/evil", "/a/evil2"}},
+		{"parent is link", []step{
+			mkdir("/a/b"), link("/", "/a/b/l"), link("../xfoo/secret", "/a/b/l/evil"),
+		}, []string{"/evil", "/a/b/l/evil"}},
+		{"parent is link then rename", []step{
+			mkdir("/a/b"), link("/", "/a/b/l"), link("../../../secret", "/a/b/l/sub/deep/evil"),
+			rename("/sub/deep/evil", "/evil"),
+		}, []string{"/evil", "/sub/deep/evil"}},
+	}
+	for _, c := range cases {
+		// Fresh environments per case so one case's links cannot help another.
+		for _, e := range envs(t) {
+			t.Run(e.name+"/"+c.name, func(t *testing.T) {
+				before := e.outsideSnapshot(t)
+				b := e.symlinkFS(t)
+				for i, s := range c.steps {
+					if err := s(b); err != nil && !errors.Is(err, basefs.ErrPathEscapes) {
+						t.Logf("step %d: %v", i, err)
+					}
+				}
+				for _, p := range c.probe {
+					if data, err := b.ReadFile(p); err == nil && (string(data) == "SECRET" || string(data) == "PARENT") {
+						t.Errorf("ReadFile(%q) read outside the root: %q", p, data)
+					}
+					if f, err := b.OpenFile(p, os.O_WRONLY|os.O_TRUNC, 0); err == nil {
+						_, _ = f.Write([]byte("PWNED"))
+						_ = f.Close()
+					}
+					if target, err := b.Readlink(p); err == nil && strings.Contains(target, "..") {
+						t.Errorf("Readlink(%q) = %q, holds ..", p, target)
+					}
+				}
+				if after := e.outsideSnapshot(t); after != before {
+					t.Errorf("outside of root changed:\nbefore\n%s\nafter\n%s", before, after)
+				}
+			})
+		}
 	}
 }
