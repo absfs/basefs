@@ -1,7 +1,6 @@
 package basefs
 
 import (
-	"flag"
 	"os"
 	"runtime"
 	"testing"
@@ -9,24 +8,6 @@ import (
 	"github.com/absfs/fstesting"
 	"github.com/absfs/osfs"
 )
-
-// suiteSkip names the one fstesting subtest basefs deliberately fails.
-// RelativeSymlink expects Readlink to return "../rel_target.txt" verbatim,
-// but basefs stores a climbing relative target as an absolute path so that
-// Rename cannot carry it out of the root (see Symlink), and Readlink then
-// reports "/.../rel_target.txt". TestSymlinkCannotBeMadeToEscape and
-// TestSymlinkTargets pin the actual behaviour. fstesting has no per-subtest
-// skip (Suite.RunWithSkips ignores its arguments), so the -skip flag is set
-// here unless the caller passed one.
-const suiteSkip = `^TestBaseFSSuite$/^Symlinks(#[0-9]+)?$/^RelativeSymlink$`
-
-func TestMain(m *testing.M) {
-	flag.Parse()
-	if f := flag.Lookup("test.skip"); f != nil && f.Value.String() == "" {
-		_ = f.Value.Set(suiteSkip)
-	}
-	os.Exit(m.Run())
-}
 
 // TestBaseFSSuite runs the standard fstesting suite against basefs wrapping osfs.
 func TestBaseFSSuite(t *testing.T) {

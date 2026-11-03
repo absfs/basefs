@@ -216,11 +216,17 @@ func TestSymlinkWindowsRules(t *testing.T) {
 	f := &SymlinkFileSystem{baseFS: baseFS{cwd: "/", prefix: `C:\root`, fs: lfs}, sfs: lfs}
 
 	readlink := map[string]string{
-		`C:\root\a\b`:   "/a/b",
-		"/c/root/a":     "/a",
-		`c:\ROOT`:       "/",
-		`..\sibling`:    `..\sibling`,
-		`relative\file`: `relative\file`,
+		`C:\root\a\b`:    "/a/b",
+		"/c/root/a":      "/a",
+		`c:\ROOT`:        "/",
+		`C:\root\`:       "/",
+		`C:\root\a\..\b`: "/a/../b",
+		// As written it would climb above the root: reported cleaned.
+		`C:\root\..\root\a`:    "/a",
+		`C:\rootfoo\..\root\a`: "/a",
+		`c:root\a`:             "/a",
+		`..\sibling`:           `..\sibling`,
+		`relative\file`:        `relative\file`,
 	}
 	for target, want := range readlink {
 		lfs.target = target
@@ -238,13 +244,23 @@ func TestSymlinkWindowsRules(t *testing.T) {
 	if err := f.Symlink("/a", "/l"); err != nil || lfs.gotOld != `C:\root\a` || lfs.gotNew != `C:\root\l` {
 		t.Errorf("Symlink(/a, /l) stored (%q, %q), %v", lfs.gotOld, lfs.gotNew, err)
 	}
-	// A climbing relative target is stored absolute; a descending one stays
-	// relative, cleaned, with forward slashes.
-	if err := f.Symlink(`..\x`, `sub\l`); err != nil || lfs.gotOld != `C:\root\x` || lfs.gotNew != `C:\root\sub\l` {
+	// Relative targets are stored verbatim, backslashes and all.
+	if err := f.Symlink(`..\x`, `sub\l`); err != nil || lfs.gotOld != `..\x` || lfs.gotNew != `C:\root\sub\l` {
 		t.Errorf(`Symlink(..\x, sub\l) stored (%q, %q), %v`, lfs.gotOld, lfs.gotNew, err)
 	}
-	if err := f.Symlink(`d\..\x\`, `sub\l`); err != nil || lfs.gotOld != "x" {
+	if err := f.Symlink(`d\..\x\`, `sub\l`); err != nil || lfs.gotOld != `d\..\x\` {
 		t.Errorf(`Symlink(d\..\x\, sub\l) stored %q, %v`, lfs.gotOld, err)
+	}
+	// An absolute target is stored under the root as written and reads back
+	// unchanged, with forward slashes.
+	for _, target := range []string{"/a/./b/", "/a/../b", "/", `\a\b`} {
+		if err := f.Symlink(target, "/l"); err != nil || !strings.HasPrefix(lfs.gotOld, `C:\root`) {
+			t.Errorf("Symlink(%q, /l) stored %q, %v", target, lfs.gotOld, err)
+		}
+		lfs.target = lfs.gotOld
+		if got, err := f.Readlink("/l"); err != nil || got != strings.ReplaceAll(target, `\`, "/") {
+			t.Errorf("Readlink after Symlink(%q) = %q, %v (stored %q)", target, got, err, lfs.gotOld)
+		}
 	}
 	for _, c := range [][2]string{{`C:\x`, "/l"}, {`\\srv\share`, "/l"}, {`..\..\x`, `sub\l`}, {"/a", `C:\l`}} {
 		err := f.Symlink(c[0], c[1])

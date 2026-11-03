@@ -21,14 +21,24 @@
 // host OS), a link inside the root whose target lies outside it is followed
 // out of the root.
 //
-// Links created through Symlink cannot be made to do that. Their targets are
-// checked against the root and stored without any ".." (see Symlink), so
-// neither a later Rename of the link or of a directory above it, nor a
-// symlinked directory it is created beneath, can make them point outside
-// the root. Readlink never
-// reports a host path outside the root. A link placed by another process,
-// however, is followed by the host wherever it points. Use an OS-level
-// mechanism (os.Root, a chroot, a container) when the tree may contain links
+// Symlink stores a relative target verbatim, and an absolute target as the
+// root's host path followed by the target, so Readlink returns exactly the
+// text given to Symlink, as POSIX tools expect. It refuses a target that,
+// resolved lexically from the link's directory, would climb above the root.
+// That check is made on names, once, at creation. basefs cannot stop the
+// host from following a link physically, so a link that was inside the root
+// when made can lead out of it when the host follows it later:
+//
+//   - a relative link such as "../f", moved by Rename (or carried by a Rename
+//     of a directory holding it) somewhere shallower, now climbs further;
+//   - a target such as "l/../f", where l is itself a symlink, is resolved by
+//     the host through wherever l points, not lexically;
+//   - a link created beneath a symlinked directory is resolved by the host
+//     from the directory it actually lands in.
+//
+// Readlink never reports a host path outside the root. Use an OS-level
+// mechanism (os.Root, a chroot, a container) when the host's own resolution
+// of links must stay inside the root, or when the tree may contain links
 // that basefs did not create.
 //
 // Errors report the caller's names, never the underlying host paths.
@@ -500,10 +510,14 @@ func (f *SymlinkFileSystem) Lchown(name string, uid, gid int) error {
 
 // Readlink returns the target of the symlink name.
 //
-// A relative target is returned unchanged; it is relative to the link's
-// directory. An absolute target inside the root is returned as a virtual
-// path. An absolute target outside the root has no virtual equivalent and is
-// never revealed: Readlink returns an *os.PathError wrapping ErrPathEscapes.
+// A relative target is returned exactly as stored; it is relative to the
+// link's directory. An absolute target on or below the root's host path is
+// returned as an absolute virtual path: the root is removed and the rest is
+// returned as written, so Readlink(l) after Symlink(t, l) returns t. (If the
+// rest, as written, would climb above the root, the cleaned virtual path is
+// returned instead.) An absolute target outside the root has no virtual
+// equivalent and is never revealed: Readlink returns an *os.PathError
+// wrapping ErrPathEscapes.
 func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
 	_, hpath, err := f.path("readlink", name)
 	if err != nil {
@@ -522,29 +536,69 @@ func (f *SymlinkFileSystem) Readlink(name string) (string, error) {
 	if !ok {
 		return "", &os.PathError{Op: "readlink", Path: name, Err: ErrPathEscapes}
 	}
+	// Prefer the target as written ("..", "." and doubled or trailing
+	// slashes intact), so a link made by Symlink reads back as the text it
+	// was given, provided it reads lexically as a path inside the root.
+	if v, ok := verbatimRel(f.prefix, target); ok {
+		if _, ok := cleanVirtual(v); ok {
+			return v, nil
+		}
+	}
 	return vpath, nil
+}
+
+// verbatimRel is relTo without cleaning host: it removes root from the front
+// of host on a separator boundary and returns the rest, as written but with
+// forward slashes, as a virtual path.
+func verbatimRel(root, host string) (string, bool) {
+	r := normalizeForComparison(root)
+	h := toSlash(host)
+	if windowsPaths && len(h) >= 2 && h[1] == ':' && unicode.IsLetter(rune(h[0])) {
+		// C:/x -> /c/x, as normalizeForComparison does, minus the cleaning.
+		rest := h[2:]
+		if !strings.HasPrefix(rest, "/") {
+			rest = "/" + rest
+		}
+		h = "/" + strings.ToLower(h[:1]) + rest
+	}
+	if !strings.HasSuffix(r, "/") {
+		if equalPath(h, r) {
+			return "/", true
+		}
+		r += "/"
+	}
+	if len(h) < len(r) || !equalPath(h[:len(r)], r) {
+		return "", false
+	}
+	return "/" + h[len(r):], true
 }
 
 // Symlink creates newname as a symbolic link to oldname.
 //
-// oldname is resolved to a virtual path: an absolute oldname is taken as is,
-// a relative one is joined to the directory of newname. ".." elements are
-// resolved lexically, before any symlink is followed, so "l/../f" names f
-// beside l whatever l points to. If the result would climb above the root,
+// Readlink of the new link returns oldname unchanged. What is stored on the
+// underlying filesystem is:
+//
+//   - for a relative oldname ("f", "../f"), oldname itself, byte for byte;
+//   - for an absolute oldname ("/a/f"), the root's host path followed by
+//     oldname, so the host resolves it inside the root. A program that reads
+//     the link directly from the underlying filesystem, bypassing basefs,
+//     sees that host path (for example "/srv/data/a/f" for a root of
+//     /srv/data), and the link breaks if the root directory itself is moved
+//     on the host. On Windows the separators of an absolute oldname are
+//     reported back by Readlink as forward slashes.
+//
+// At creation, oldname is checked lexically: a relative oldname is joined to
+// the directory of newname, and ".." elements are applied to the name
+// without following any symlink. If the result would climb above the root,
 // Symlink returns an *os.LinkError wrapping ErrPathEscapes and creates
-// nothing.
+// nothing. On Windows, an oldname carrying a volume is rejected the same way.
 //
-// The target stored in the link never contains "..", so the link cannot be
-// made to point outside the root by moving it, or a directory above it, with
-// Rename, or by creating it beneath a symlinked directory:
-//
-//   - A relative oldname that does not climb out of the link's directory
-//     once cleaned ("f", "sub/f", "l/../f") is stored cleaned and relative.
-//     It only descends from wherever the link is.
-//   - An absolute oldname, or a relative one that climbs ("../f"), is stored
-//     as the absolute host path of its virtual target. Readlink reports it
-//     as an absolute virtual path ("/f"), not as the text passed in, and the
-//     link breaks if the root itself is moved on the host.
+// That check concerns names, at creation time. The host follows a stored
+// link physically, so a link that named a place inside the root when it was
+// made can resolve outside it later: a relative link moved by Rename (or
+// inside a directory moved by Rename) somewhere shallower, or a target whose
+// ".." follows an element that is itself a symlink. See the package
+// documentation.
 func (f *SymlinkFileSystem) Symlink(oldname, newname string) error {
 	vlink, hlink, err := f.path("symlink", newname)
 	if err != nil {
@@ -556,21 +610,19 @@ func (f *SymlinkFileSystem) Symlink(oldname, newname string) error {
 	}
 
 	target := toSlash(oldname)
-	rel := !path.IsAbs(target)
-	if rel {
-		target = path.Clean(target)
+	abs := path.IsAbs(target)
+	resolved := target
+	if !abs {
+		resolved = path.Dir(vlink) + "/" + target
 	}
-	vtarget, ok := cleanVirtual(target)
-	if rel {
-		vtarget, ok = cleanVirtual(path.Dir(vlink) + "/" + target)
-	}
-	if !ok || (windowsPaths && hasVolume(oldname)) {
+	if _, ok := cleanVirtual(resolved); !ok || (windowsPaths && hasVolume(oldname)) {
 		return &os.LinkError{Op: "symlink", Old: oldname, New: newname, Err: ErrPathEscapes}
 	}
-	if !rel || target == ".." || strings.HasPrefix(target, "../") {
-		target = f.host(vtarget)
+	stored := oldname
+	if abs {
+		stored = f.host(target)
 	}
-	return f.fixLinkErr("symlink", oldname, newname, f.sfs.Symlink(target, hlink))
+	return f.fixLinkErr("symlink", oldname, newname, f.sfs.Symlink(stored, hlink))
 }
 
 // FileSystem is a basefs over an absfs.FileSystem without symlink support.
