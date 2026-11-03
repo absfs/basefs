@@ -1188,7 +1188,7 @@ type unconfined struct{ absfs.SymlinkFileSystem }
 // root although Symlink accepted each one. The target check in Symlink is
 // lexical and made once, at creation; the host follows links physically,
 // later. Over osfs with its OpenRoot hidden, the host follows each link out:
-// basefs reads "PARENT" from outside the root, and a Chmod (which absnfs
+// basefs reads "PARENT" from outside the root, and a Chtimes (which absnfs
 // issues for an NFS SETATTR on the link's handle) changes the file there.
 // Over osfs itself, where it can confine to the root (Go 1.25, Unix), every
 // operation that would follow the link fails with ErrPathEscapes and nothing
@@ -1261,11 +1261,14 @@ func TestSymlinkHostFollow(t *testing.T) {
 					if data, err := b.ReadFile(c.probe); err != nil || string(data) != "PARENT" {
 						t.Errorf("ReadFile(%q) = %q, %v; expected the host to follow the link out of the root", c.probe, data, err)
 					}
-					if err := b.Chmod(c.probe, 0o600); err != nil {
+					// Chtimes rather than Chmod: on Windows a mode change
+					// from 0644 to 0600 changes nothing.
+					when := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+					if err := b.Chtimes(c.probe, when, when); err != nil {
 						t.Fatal(err)
 					}
 					if e.outsideSnapshot(t) == before {
-						t.Errorf("Chmod(%q) changed nothing outside the root; expected the host to follow the link out", c.probe)
+						t.Errorf("Chtimes(%q) changed nothing outside the root; expected the host to follow the link out", c.probe)
 					}
 					return
 				}
