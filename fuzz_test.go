@@ -231,7 +231,12 @@ func FuzzSymlinkOperations(f *testing.F) {
 			p.err("Symlink", err)
 			got, rerr := p.readlink(link)
 			if err == nil && target != "" {
-				if rerr != nil || filepath.ToSlash(got) != filepath.ToSlash(target) {
+				want := filepath.ToSlash(target)
+				if path.IsAbs(want) {
+					// Windows hosts store absolute targets cleaned.
+					want = winClean(p.e, want)
+				}
+				if rerr != nil || filepath.ToSlash(got) != want {
 					t.Errorf("%s: Readlink(%q) = %q, %v after Symlink(%q)", p.e.name, link, got, rerr, target)
 				}
 			}

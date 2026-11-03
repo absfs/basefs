@@ -500,7 +500,7 @@ func TestReadlink(t *testing.T) {
 				{"abs_sibling_dir", e.join(e.parent, "xfoo"), "", true},
 				{"abs_parent", e.parent, "", true},
 				// An absolute target under the root reads back as written...
-				{"abs_messy", e.root + "/sub/../inside.txt", "/sub/../inside.txt", false},
+				{"abs_messy", e.root + "/sub/../inside.txt", winClean(e, "/sub/../inside.txt"), false},
 				{"abs_slash", e.root + "/", "/", false},
 				// ...unless as written it would climb above the root.
 				{"abs_climb", e.root + "/../x/inside.txt", "/inside.txt", false},
@@ -562,8 +562,12 @@ func TestSymlinkTargets(t *testing.T) {
 					t.Errorf("ReadFile(%q) = %q, %v", c.link, data, err)
 				}
 				// Readlink returns exactly the text given to Symlink.
-				if got, err := b.Readlink(c.link); err != nil || got != c.target {
-					t.Errorf("Readlink(%q) = %q, %v; want %q", c.link, got, err, c.target)
+				want := c.target
+				if path.IsAbs(want) {
+					want = winClean(e, want)
+				}
+				if got, err := b.Readlink(c.link); err != nil || got != want {
+					t.Errorf("Readlink(%q) = %q, %v; want %q", c.link, got, err, want)
 				}
 				raw, err := e.under.Readlink(e.join(append([]string{e.root}, c.hostLink...)...))
 				if err != nil {
@@ -633,6 +637,16 @@ func TestSymlinkTargets(t *testing.T) {
 			}
 		})
 	}
+}
+
+// winClean returns the absolute virtual path p as Readlink reports it on e:
+// unchanged, except on Windows hosts, which store absolute link targets
+// cleaned.
+func winClean(e *env, p string) string {
+	if e.name == "osfs" && runtime.GOOS == "windows" {
+		return path.Clean(p)
+	}
+	return p
 }
 
 func hostRel(e *env, host string) (string, bool) {
