@@ -260,7 +260,8 @@ func checkEscapeErr(t *testing.T, e *env, kind string, op escapeOp, name string,
 		t.Errorf("%s(%q) = %v, want ErrPathEscapes", op.name, name, err)
 		return
 	}
-	if strings.Contains(err.Error(), e.parent) {
+	// The caller's own name is echoed back; nothing else may mention the host.
+	if strings.Contains(strings.ReplaceAll(err.Error(), name, ""), e.parent) {
 		t.Errorf("%s(%q) error leaks host path: %v", op.name, name, err)
 	}
 	if op.link {
@@ -350,7 +351,6 @@ func TestNamesInsideRoot(t *testing.T) {
 		"inside.txt":                 "inside",
 		"/inside.txt":                "inside",
 		"./inside.txt":               "inside",
-		"//inside.txt":               "inside",
 		"/./inside.txt":              "inside",
 		"sub/../inside.txt":          "inside",
 		"/sub/deep/../../inside.txt": "inside",
@@ -362,6 +362,9 @@ func TestNamesInsideRoot(t *testing.T) {
 		names[`sub\deep\f.txt`] = "deep"
 		names[`\sub\..\inside.txt`] = "inside"
 		dirs = append(dirs, `sub\`, `\`)
+	} else {
+		// On Windows "//inside.txt" is a UNC volume and is rejected.
+		names["//inside.txt"] = "inside"
 	}
 	for _, e := range envs(t) {
 		t.Run(e.name, func(t *testing.T) {
