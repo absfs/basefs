@@ -19,16 +19,17 @@
 // underlying filesystem does with that path. In particular, when the
 // underlying filesystem follows symbolic links (as osfs does, through the
 // host OS), a link inside the root whose target lies outside it is followed
-// out of the root.
+// out of the root, unless the underlying filesystem confines itself to the
+// root (see below).
 //
 // Symlink stores a relative target verbatim, and an absolute target as the
 // root's host path followed by the target, so Readlink returns exactly the
 // text given to Symlink, as POSIX tools expect. It refuses a target that,
 // resolved lexically from the link's directory, would climb above the root,
 // and an absolute target that is not clean ("/a/../b"). That check is made
-// on names, once, at creation. basefs cannot stop the host from following a
-// link physically, so a link that was inside the root when made can lead out
-// of it when the host follows it later:
+// on names, once, at creation. basefs alone cannot stop the host from
+// following a link physically, so a link that was inside the root when made
+// can lead out of it when the host follows it later:
 //
 //   - a relative link such as "../f", moved by Rename (or carried by a Rename
 //     of a directory holding it) somewhere shallower, now climbs further;
@@ -37,10 +38,20 @@
 //   - a link created beneath a symlinked directory is resolved by the host
 //     from the directory it actually lands in.
 //
-// Readlink never reports a host path outside the root. Use an OS-level
-// mechanism (os.Root, a chroot, a container) when the host's own resolution
-// of links must stay inside the root, or when the tree may contain links
-// that basefs did not create.
+// Readlink never reports a host path outside the root.
+//
+// When the underlying filesystem has an OpenRoot(dir string)
+// (absfs.SymlinkFileSystem, error) method, NewFS and NewFileSystem operate
+// through what it returns for the root. osfs, built with Go 1.25 or later on
+// a Unix system, returns a filesystem confined to the root by os.Root. The
+// host then never follows a link out of the root: each case above fails with
+// ErrPathEscapes, as does any link placed on the host that leads outside.
+// Absolute links that basefs stored still resolve inside the root. Confined
+// reports whether a basefs is confined this way. If OpenRoot reports
+// errors.ErrUnsupported (osfs before Go 1.25, or on Windows), basefs uses
+// the underlying filesystem directly and constrains names only. Use another
+// OS-level mechanism (a chroot, a container) when the host's own resolution
+// of links must stay inside the root there.
 //
 // Errors report the caller's names, never the underlying host paths.
 package basefs
@@ -185,11 +196,19 @@ func isReservedName(elem string) bool {
 	return false
 }
 
+// rootOpener is implemented by an underlying filesystem that can confine
+// itself to one of its directories, as osfs does with os.Root.
+type rootOpener interface {
+	OpenRoot(dir string) (absfs.SymlinkFileSystem, error)
+}
+
 // baseFS contains the implementation shared by FileSystem and SymlinkFileSystem.
 type baseFS struct {
-	cwd    string // clean, absolute virtual path
-	prefix string // cleaned root in the underlying filesystem's syntax
-	fs     absfs.FileSystem
+	cwd      string // clean, absolute virtual path
+	prefix   string // cleaned root in the underlying filesystem's syntax
+	fs       absfs.FileSystem
+	under    absfs.FileSystem        // the filesystem given to NewFS
+	confined absfs.SymlinkFileSystem // fs, when confined to the root
 }
 
 // newBase validates dir and returns a baseFS rooted at it.
@@ -212,7 +231,19 @@ func newBase(fsys absfs.FileSystem, dir string) (baseFS, error) {
 	if !info.IsDir() {
 		return baseFS{}, errors.New("not a directory")
 	}
-	return baseFS{cwd: "/", prefix: dir, fs: fsys}, nil
+	b := baseFS{cwd: "/", prefix: dir, fs: fsys, under: fsys}
+	// Where the underlying filesystem can confine itself to the root (osfs
+	// with Go 1.25 on Unix), let it, so the host cannot follow a link out.
+	if ro, ok := fsys.(rootOpener); ok {
+		confined, err := ro.OpenRoot(dir)
+		switch {
+		case err == nil:
+			b.fs, b.confined = confined, confined
+		case !errors.Is(err, errors.ErrUnsupported):
+			return baseFS{}, err
+		}
+	}
+	return b, nil
 }
 
 // virtual resolves name to a clean, absolute virtual path, reporting false if
@@ -484,6 +515,9 @@ func NewFS(fs absfs.SymlinkFileSystem, dir string) (*SymlinkFileSystem, error) {
 	if err != nil {
 		return nil, err
 	}
+	if base.confined != nil {
+		fs = base.confined
+	}
 	return &SymlinkFileSystem{baseFS: base, sfs: fs}, nil
 }
 
@@ -606,11 +640,11 @@ func verbatimRel(root, host string) (string, bool) {
 // back as written. On Windows, an oldname carrying a volume is refused too.
 //
 // That check concerns names, at creation time. The host follows a stored
-// link physically, so a link that named a place inside the root when it was
-// made can resolve outside it later: a relative link moved by Rename (or
-// inside a directory moved by Rename) somewhere shallower, or a relative
-// target whose ".." follows an element that is itself a symlink. See the
-// package documentation.
+// link physically, so unless the basefs is Confined, a link that named a
+// place inside the root when it was made can resolve outside it later: a
+// relative link moved by Rename (or inside a directory moved by Rename)
+// somewhere shallower, or a relative target whose ".." follows an element
+// that is itself a symlink. See the package documentation.
 func (f *SymlinkFileSystem) Symlink(oldname, newname string) error {
 	vlink, hlink, err := f.path("symlink", newname)
 	if err != nil {

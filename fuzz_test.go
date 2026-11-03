@@ -206,7 +206,7 @@ func FuzzDirectoryRestriction(f *testing.F) {
 // a tree that holds no other links. Symlink must either refuse it or store it
 // so that Readlink returns the target exactly as given, and reading or
 // writing through the link must stay inside the root. (Rearranging links
-// afterwards is a documented limitation; see TestSymlinkHostFollowLimits.)
+// afterwards is covered by TestSymlinkHostFollow.)
 func FuzzSymlinkOperations(f *testing.F) {
 	f.Add("link", "../../../etc/passwd")
 	f.Add("/a/l", "../xfoo/secret")

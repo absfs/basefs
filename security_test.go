@@ -1180,14 +1180,20 @@ func TestSymlinkAbsoluteTargetThroughLink(t *testing.T) {
 	}
 }
 
-// TestSymlinkHostFollowLimits pins down what basefs does not guarantee, as
-// the package documentation says. The target check in Symlink is lexical and
-// made once, at creation; the host OS follows links physically, later. Each
-// case below makes only links that Symlink accepts, yet the host, following
-// them through osfs, reads "PARENT" from outside the root. These are the
-// cases os.Root, a chroot or a container is needed for. If basefs ever
-// prevents one, update the documentation along with this test.
-func TestSymlinkHostFollowLimits(t *testing.T) {
+// unconfined hides osfs's OpenRoot, so a basefs over it constrains names
+// only, as it does over osfs before Go 1.25 and on Windows.
+type unconfined struct{ absfs.SymlinkFileSystem }
+
+// TestSymlinkHostFollow reproduces the links that lead the host out of the
+// root although Symlink accepted each one. The target check in Symlink is
+// lexical and made once, at creation; the host follows links physically,
+// later. Over osfs with its OpenRoot hidden, the host follows each link out:
+// basefs reads "PARENT" from outside the root, and a Chmod (which absnfs
+// issues for an NFS SETATTR on the link's handle) changes the file there.
+// Over osfs itself, where it can confine to the root (Go 1.25, Unix), every
+// operation that would follow the link fails with ErrPathEscapes and nothing
+// outside the root changes.
+func TestSymlinkHostFollow(t *testing.T) {
 	type step struct{ op, a, b string }
 	cases := []struct {
 		name    string
@@ -1215,29 +1221,86 @@ func TestSymlinkHostFollowLimits(t *testing.T) {
 		}, "/evil", true},
 	}
 	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if c.posixly && runtime.GOOS == "windows" {
-				t.Skip("Windows resolves .. in a link target before following links")
-			}
-			e := osEnv(t)
-			b := e.symlinkFS(t)
-			for _, s := range c.steps {
-				var err error
-				switch s.op {
-				case "mkdir":
-					err = b.MkdirAll(s.a, 0o755)
-				case "symlink":
-					err = b.Symlink(s.a, s.b)
-				case "rename":
-					err = b.Rename(s.a, s.b)
+		for _, confine := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/confined=%v", c.name, confine), func(t *testing.T) {
+				if c.posixly && runtime.GOOS == "windows" {
+					t.Skip("Windows resolves .. in a link target before following links")
 				}
+				e := osEnv(t)
+				under := e.under
+				if !confine {
+					under = unconfined{e.under}
+				}
+				b, err := basefs.NewFS(under, e.root)
 				if err != nil {
-					t.Fatalf("%s(%q, %q) = %v", s.op, s.a, s.b, err)
+					t.Fatal(err)
 				}
-			}
-			if data, err := b.ReadFile(c.probe); err != nil || string(data) != "PARENT" {
-				t.Errorf("ReadFile(%q) = %q, %v; expected the host to follow the link out of the root", c.probe, data, err)
-			}
-		})
+				if confine && !basefs.Confined(b) {
+					t.Skip("osfs cannot confine itself with this Go release on this OS")
+				}
+				if !confine && basefs.Confined(b) {
+					t.Fatal("Confined over osfs without OpenRoot")
+				}
+				for _, s := range c.steps {
+					var err error
+					switch s.op {
+					case "mkdir":
+						err = b.MkdirAll(s.a, 0o755)
+					case "symlink":
+						err = b.Symlink(s.a, s.b)
+					case "rename":
+						err = b.Rename(s.a, s.b)
+					}
+					if err != nil {
+						t.Fatalf("%s(%q, %q) = %v", s.op, s.a, s.b, err)
+					}
+				}
+				before := e.outsideSnapshot(t)
+
+				if !confine {
+					if data, err := b.ReadFile(c.probe); err != nil || string(data) != "PARENT" {
+						t.Errorf("ReadFile(%q) = %q, %v; expected the host to follow the link out of the root", c.probe, data, err)
+					}
+					if err := b.Chmod(c.probe, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					if e.outsideSnapshot(t) == before {
+						t.Errorf("Chmod(%q) changed nothing outside the root; expected the host to follow the link out", c.probe)
+					}
+					return
+				}
+
+				escapes := func(what string, err error) {
+					t.Helper()
+					if !errors.Is(err, basefs.ErrPathEscapes) {
+						t.Errorf("%s(%q) = %v, want ErrPathEscapes", what, c.probe, err)
+					}
+				}
+				_, err = b.ReadFile(c.probe)
+				escapes("ReadFile", err)
+				_, err = b.Open(c.probe)
+				escapes("Open", err)
+				_, err = b.Stat(c.probe)
+				escapes("Stat", err)
+				_, err = b.OpenFile(c.probe, os.O_WRONLY|os.O_APPEND, 0)
+				escapes("OpenFile", err)
+				_, err = b.Create(c.probe)
+				escapes("Create", err)
+				escapes("Truncate", b.Truncate(c.probe, 0))
+				escapes("Chmod", b.Chmod(c.probe, 0o600))
+				escapes("Chtimes", b.Chtimes(c.probe, time.Unix(1, 0), time.Unix(1, 0)))
+				escapes("Chown", b.Chown(c.probe, os.Getuid(), os.Getgid()))
+				if after := e.outsideSnapshot(t); after != before {
+					t.Errorf("outside the root changed:\n%s\nwant:\n%s", after, before)
+				}
+				// The link itself is still there to read and remove.
+				if _, err := b.Readlink(c.probe); err != nil {
+					t.Errorf("Readlink(%q) = %v", c.probe, err)
+				}
+				if err := b.Remove(c.probe); err != nil {
+					t.Errorf("Remove(%q) = %v", c.probe, err)
+				}
+			})
+		}
 	}
 }

@@ -7,7 +7,7 @@
 
 The `basefs` package implements the `absfs.FileSystem` interface by constraining a `absfs.FileSystem` to a specific subdirectory. A basefs filesystem is re-rooted at that directory: its `/` is the directory, and no name can reach a path outside it. Every path passed to the underlying filesystem is an absolute path that basefs constructs to avoid ambiguity. basefs then calls the underlying filesystem's methods normally. Errors report the name the caller passed in, never the underlying host path.
 
-The `basefs` package also provides `Prefix` and `Unwrap` functions for debugging purposes.
+The `basefs` package also provides `Prefix` and `Unwrap` functions for debugging purposes, and `Confined`, which reports whether the host is kept from following symlinks out of the root (see [Confinement over osfs](#confinement-over-osfs-osroot)).
 
 ## Containment
 
@@ -36,7 +36,22 @@ The target check is made on names, once, when the link is created. A link that w
 - A relative target whose `..` follows an element that is itself a symlink (`l/../f`), or a link created beneath a symlinked directory: the host resolves `..` from wherever the symlink leads, not lexically. (Absolute targets cannot contain `..`.)
 - A link placed by another process, or replaced between a check and a use.
 
-If the host's own resolution of links must stay inside the root, use an OS-level mechanism: `os.Root`, a chroot, or a container.
+Any operation that follows a link can then act outside the root: reading, but also `Chmod`, `Chtimes`, `Truncate` and opening for writing. An NFS server such as absnfs issues those on a link's own path for a SETATTR on the link's handle.
+
+### Confinement over osfs (os.Root)
+
+When the underlying filesystem can confine itself to the root, basefs lets it, and the host can then never follow a link out of the root. `NewFS` and `NewFileSystem` look for an `OpenRoot(dir string) (absfs.SymlinkFileSystem, error)` method on the underlying filesystem. If it has one, they operate through what it returns. `osfs` has one: with Go 1.25 or later on a Unix system it returns an `osfs.RootFS`, which resolves every name through an [`os.Root`](https://pkg.go.dev/os#Root).
+
+- Every case above fails with an error wrapping `ErrPathEscapes` instead of leaving the root. So does any link placed on the host that leads outside, and a directory swapped for such a link mid-operation.
+- Links that stay inside the root work as before. That includes absolute ones: basefs stores them as the root's host path followed by the target, and `RootFS` follows such a target inside the root. `Readlink` and `Symlink` are unchanged.
+- `Confined(fs)` reports whether a basefs is confined this way. `Unwrap` still returns the filesystem given to `NewFS`, which is not confined.
+- Before Go 1.25, and on Windows, `osfs.OpenRoot` reports `errors.ErrUnsupported`, and basefs constrains names only, as described above. Any other `OpenRoot` error fails `NewFS`.
+
+Where `Confined` is false and the host's own resolution of links must stay inside the root, use another OS-level mechanism: a chroot or a container.
+
+### Absolute targets seen by clients
+
+`Readlink` returns an absolute target as written (`/etc/passwd`), and a program that follows the link itself resolves it against its own root, not the basefs root. Over NFS, that means the client follows it. For a remote client, the target names a path on the client machine. For a client mounting from the same host (a loopback mount, or an agent running beside the server), it names the server's own files: an NFS client that creates `ln -s /srv/state/other/file l` in its workspace and then reads, writes, truncates or chmods `l` does so on that host path. The client does this itself, with its own credentials, so it gains no access it did not already have. But a client on the server's host is only confined to its workspace if its own process is confined too, by a sandbox, a chroot, a container or a mount namespace. basefs, and confinement on the server, cannot change where a client resolves a link.
 
 ### Other methods
 

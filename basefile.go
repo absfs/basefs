@@ -9,6 +9,7 @@ import (
 	"unicode"
 
 	"github.com/absfs/absfs"
+	"github.com/absfs/osfs"
 )
 
 // File is an open file in a basefs filesystem. Errors it returns report the
@@ -79,7 +80,16 @@ func (b *baseFS) fixErr(op, name string, err error) error {
 	case *os.LinkError:
 		op, err = e.Op, e.Err
 	}
-	return &os.PathError{Op: op, Path: name, Err: b.scrub(err)}
+	return &os.PathError{Op: op, Path: name, Err: b.scrub(escapes(err))}
+}
+
+// escapes reports a confined underlying filesystem's refusal to leave the
+// root as ErrPathEscapes.
+func escapes(err error) error {
+	if err == osfs.ErrPathEscapes {
+		return ErrPathEscapes
+	}
+	return err
 }
 
 // fixLinkErr is fixErr for two-name operations; the result is always an
@@ -93,7 +103,7 @@ func (b *baseFS) fixLinkErr(op, oldname, newname string, err error) error {
 	case *os.PathError:
 		err = e.Err
 	}
-	return &os.LinkError{Op: op, Old: oldname, New: newname, Err: b.scrub(err)}
+	return &os.LinkError{Op: op, Old: oldname, New: newname, Err: b.scrub(escapes(err))}
 }
 
 // fixErr reports the file's name in place of the host path. Other errors,

@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- Over osfs, basefs now keeps the host from following a symlink out of the root. Through Go 1.25 on Unix systems, `NewFS` and `NewFileSystem` use the underlying filesystem's `OpenRoot` method when it has one. osfs's returns an `os.Root`-backed `osfs.RootFS`. Before, links that `Symlink` accepted could still lead the host outside the root when it followed them later. Those were a relative link moved shallower by `Rename`, a relative target with `..` after a symlinked element, a link made beneath a symlinked directory, and links placed on the host. Read, `Chmod`, `Chtimes`, `Truncate` and write operations then acted on files outside, and an NFS SETATTR on a link's handle reaches those operations. Each now fails with `ErrPathEscapes`. Absolute links inside the root still work. Before Go 1.25 and on Windows, osfs reports `errors.ErrUnsupported`, and basefs constrains names only, as before.
+- The README documents that NFS clients resolve absolute symlink targets on their own root. A client on the server's own host therefore needs its own sandbox to be confined to its workspace.
 - Root containment is now checked on path-separator boundaries. Previously a name with `..` could reach a sibling directory whose name starts with the root's name: with a root of `/d/x`, `../xfoo/secret` read `/d/xfoo/secret`. Names are now cleaned without clamping at the root, and any name that climbs above `/` is rejected. The joined host path must then equal the root or lie below it on a separator boundary. This includes roots of `/` and Windows volume roots.
 - On Windows, backslashes in names are treated as separators. Names carrying a volume (`C:\x`, `c:x`, `\\server\share`, `\\?\...`), names containing a colon (alternate data streams such as `file:stream`) and names with a reserved device name element (`NUL`, `sub\CON`, `CONIN$`, `aux.`) are rejected. Previously `..\` sequences and drive-letter names passed through to the host unchecked.
 - `Symlink` rejects targets that resolve outside the root: relative targets are resolved lexically from the link's directory, and Windows volume paths are rejected. Previously a relative or drive-letter target could plant a link that escapes the root.
@@ -18,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The README now documents what basefs guarantees: it constrains names; it does not control what the host follows through a symlink.
 
 ### Added
+- `Confined`, which reports whether a basefs keeps the host from following links out of its root.
 - `ErrPathEscapes`, wrapped by the error returned for any name, symlink target or link content outside the root.
 
 ### Changed

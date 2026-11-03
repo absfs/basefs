@@ -8,5 +8,5 @@ github.com/absfs/inode v1.0.0 h1:Kr0xWyXFb82DHMAuvZCbVc54s8kxO4qSoayzbVYg45g=
 github.com/absfs/inode v1.0.0/go.mod h1:0wHDtqGbzVMIXO3pIIsc0CbMOuwjemn74fCNuus9dEw=
 github.com/absfs/memfs v1.1.0 h1:gH59FquOnsU+RyQ7tz83HlChdMjdvGoX0Cr5/DFWskU=
 github.com/absfs/memfs v1.1.0/go.mod h1:A5piR5vf4Yfj1K0SENl9mXLpv3dynQ9NJTxe/O5PRto=
-github.com/absfs/osfs v1.0.1-0.20251215210911-de085c499e3f h1:0oXiolymDC7UEGBIzk6YHjBVK2WOMbLuYHOsYyr42co=
-github.com/absfs/osfs v1.0.1-0.20251215210911-de085c499e3f/go.mod h1:A4185l/2aytzdbCxJEibCsnWBVTHKPrOpCHUbCZCWX4=
+github.com/absfs/osfs v1.0.1-0.20261103224739-90c196ff0797 h1:pJcYDRumjBASDY9iPvfbZbuylUEWcfly9dLmHIHFSBc=
+github.com/absfs/osfs v1.0.1-0.20261103224739-90c196ff0797/go.mod h1:A4185l/2aytzdbCxJEibCsnWBVTHKPrOpCHUbCZCWX4=
