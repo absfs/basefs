@@ -38,8 +38,9 @@
 //     look inside the directories it moves);
 //   - a relative target such as "l/../f", where l is itself a symlink, is
 //     resolved by the host through wherever l points, not lexically;
-//   - a link created beneath a symlinked directory is resolved by the host
-//     from the directory it actually lands in.
+//   - a link created beneath, or moved by Rename into, a symlinked
+//     directory is resolved by the host from the directory it actually
+//     lands in.
 //
 // Readlink never reports a host path outside the root.
 //
@@ -471,6 +472,12 @@ func (b *baseFS) removeChildren() error {
 // The check is made whether or not the basefs is Confined. An underlying
 // filesystem with no Lstat and Readlink cannot report links, so a
 // FileSystem over it has nothing to check.
+//
+// The check is made on names, before the move. It resolves the target from
+// the destination's name, so a link moved into a symlinked directory is
+// resolved by the host from the directory it actually lands in, and a link
+// swapped in between the check and the move, by this or another process, is
+// not checked. Both rely on confinement; see the package documentation.
 //
 // Rename does not look inside a directory it moves: a relative link carried
 // by a Rename of a directory holding it can climb above the root from its

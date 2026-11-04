@@ -1220,6 +1220,13 @@ func TestSymlinkHostFollow(t *testing.T) {
 		{"link under a linked directory", []step{
 			{"mkdir", "/a", ""}, {"symlink", "/", "/a/l"}, {"symlink", "../secret", "/a/l/evil"},
 		}, "/evil", true},
+		// A link moved by Rename into a symlinked directory. Rename checks
+		// the target from the destination's name, /a/b/up, but the host
+		// puts the link where up leads, the root, and resolves ".." there.
+		{"rename link into a linked directory", []step{
+			{"mkdir", "/a/b", ""}, {"symlink", "../..", "/a/b/up"}, {"symlink", "../secret", "/a/b/e"},
+			{"rename", "/a/b/e", "/a/b/up/e"},
+		}, "/e", true},
 	}
 	for _, c := range cases {
 		for _, confine := range []bool{false, true} {
