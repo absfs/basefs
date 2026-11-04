@@ -545,7 +545,7 @@ func (b *baseFS) Stat(name string) (os.FileInfo, error) {
 	if err != nil {
 		return nil, b.fixErr("stat", name, err)
 	}
-	return &fileinfo{info, path.Base(vpath)}, nil
+	return named(info, path.Base(vpath)), nil
 }
 
 // Chmod changes the mode of the named file to mode.
@@ -667,7 +667,7 @@ func (f *SymlinkFileSystem) Lstat(name string) (os.FileInfo, error) {
 	if err != nil {
 		return nil, f.fixErr("lstat", name, err)
 	}
-	return &fileinfo{info, path.Base(vpath)}, nil
+	return named(info, path.Base(vpath)), nil
 }
 
 // Lchown changes the owner and group ids of name without following a final

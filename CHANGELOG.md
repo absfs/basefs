@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `FileSystem` and `SymlinkFileSystem` share a single `baseFS` implementation of every common method.
 
 ### Fixed
+- `Stat`, `Lstat` and `File.Stat` return the underlying `FileInfo` unchanged when it already carries the virtual base name, which it does for everything below the root, and wrap only the root to name it `/`. Since `Lstat` was made to rename its result, every one of these was a basefs wrapper, so `os.SameFile` was false for all of them, and `Lstat` returned a different type from the entries `ReadDir` and `Readdir` list. Layers that use `os.SameFile` to tell a case-only rename from a rename onto another file (unionfs, and absnfs and absnfs4 above it) then silently did nothing. The root's host name is still not revealed; on Unix its `Sys` still carries the host's device and inode.
 - Fixed code formatting to comply with `gofmt` standards
 - Corrected LICENSE link in README to point to basefs repository instead of osfs
 - Removed commented-out debug code from basefile.go and basefs.go

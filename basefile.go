@@ -165,7 +165,7 @@ func (f *File) Stat() (os.FileInfo, error) {
 	if err != nil {
 		return nil, f.fixErr(err)
 	}
-	return &fileinfo{info, path.Base(f.name)}, nil
+	return named(info, path.Base(f.name)), nil
 }
 
 func (f *File) Sync() error {
@@ -194,6 +194,22 @@ func (f *File) Truncate(size int64) error {
 func (f *File) WriteString(s string) (n int, err error) {
 	n, err = f.f.WriteString(s)
 	return n, f.fixErr(err)
+}
+
+// named returns info under the name name. When the underlying filesystem
+// already reports that name, it returns info itself, so callers keep its
+// concrete type: os.SameFile works on the result, and Stat and Lstat return
+// the same type as the entries ReadDir and Readdir pass through. osfs, like
+// os.Lstat, os.Root and os.File.Stat, names a result after the base of the
+// path given, and below the root that is the virtual base name too. Only the
+// root, which the host knows by its own base name (or "."), is wrapped, so
+// its host name does not leak. A wrapped root keeps Sys, so identity checks
+// on Sys (device and inode on Unix) still work on it; os.SameFile does not.
+func named(info os.FileInfo, name string) os.FileInfo {
+	if info.Name() == name {
+		return info
+	}
+	return &fileinfo{info, name}
 }
 
 type fileinfo struct {

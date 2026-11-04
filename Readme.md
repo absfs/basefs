@@ -64,6 +64,7 @@ Where `Confined` is false and the host's own resolution of links must stay insid
 - `Chdir` requires an existing directory inside the root. `Getwd` returns a virtual path.
 - `TempDir` returns the underlying temporary directory as a virtual path if it lies inside the root, and `/tmp` otherwise.
 - `Sub` returns a read-only `fs.FS` that operates through the basefs, so it is confined as well.
+- `Stat`, `Lstat` and `File.Stat` return the underlying filesystem's `FileInfo` unchanged below the root, as `ReadDir` and `Readdir` do, so `os.SameFile` works on them and they match listed entries. Only the root is wrapped, to name it `/` rather than by its host name. The wrapped root keeps `Sys`, so on Unix its device and inode still identify it, but `os.SameFile` reports false for it.
 
 
 ## Install 
