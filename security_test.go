@@ -1083,7 +1083,8 @@ func TestErrorScrubbing(t *testing.T) {
 }
 
 // TestSymlinkNamesNeverEscape places links that lead out of the root, both a
-// link written on the host and a basefs link moved somewhere shallower, and
+// link written on the host and a basefs link carried somewhere shallower by
+// the Rename of its directory, and
 // shows that basefs still never names a path outside the root: escaping
 // names are rejected whatever links exist, and the methods that act on a
 // link itself (Lstat, Readlink, Lchown, Rename, Remove, RemoveAll) change the
@@ -1096,17 +1097,17 @@ func TestSymlinkNamesNeverEscape(t *testing.T) {
 			if err := e.under.Symlink(e.join(e.parent, "xfoo"), e.join(e.root, "out")); err != nil {
 				t.Fatal(err)
 			}
-			if err := b.Mkdir("/a", 0o755); err != nil {
+			if err := b.MkdirAll("/a/d", 0o755); err != nil {
 				t.Fatal(err)
 			}
-			if err := b.Symlink("../secret", "/a/up"); err != nil {
+			if err := b.Symlink("../../secret", "/a/d/up"); err != nil {
 				t.Fatal(err)
 			}
-			if err := b.Rename("/a/up", "/up"); err != nil {
+			if err := b.Rename("/a/d", "/d"); err != nil {
 				t.Fatal(err)
 			}
 
-			for _, name := range []string{"out/../../secret", "/up/../../xfoo/secret", "../xfoo/secret", "/a/../../secret"} {
+			for _, name := range []string{"out/../../secret", "/d/up/../../../xfoo/secret", "../xfoo/secret", "/a/../../secret"} {
 				if _, err := b.ReadFile(name); !errors.Is(err, basefs.ErrPathEscapes) {
 					t.Errorf("ReadFile(%q) = %v, want ErrPathEscapes", name, err)
 				}
@@ -1114,8 +1115,8 @@ func TestSymlinkNamesNeverEscape(t *testing.T) {
 					t.Errorf("Symlink(_, %q) = %v, want ErrPathEscapes", name, err)
 				}
 			}
-			for _, link := range []string{"/out", "/up"} {
-				if info, err := b.Lstat(link); err != nil || info.Mode()&fs.ModeSymlink == 0 || info.Name() != link[1:] {
+			for _, link := range []string{"/out", "/d/up"} {
+				if info, err := b.Lstat(link); err != nil || info.Mode()&fs.ModeSymlink == 0 || info.Name() != path.Base(link) {
 					t.Errorf("Lstat(%q) = %v, %v", link, info, err)
 				}
 				if got, err := b.Readlink(link); err == nil && strings.Contains(got, e.parent) {
@@ -1127,17 +1128,19 @@ func TestSymlinkNamesNeverEscape(t *testing.T) {
 					}
 				}
 			}
-			if got, err := b.Readlink("/up"); err != nil || got != "../secret" {
-				t.Errorf("Readlink(/up) = %q, %v", got, err)
+			if got, err := b.Readlink("/d/up"); err != nil || got != "../../secret" {
+				t.Errorf("Readlink(/d/up) = %q, %v", got, err)
 			}
 			if err := b.Rename("/out", "/a/out"); err != nil {
 				t.Fatal(err)
 			}
-			if err := b.Remove("/up"); err != nil {
+			if err := b.Remove("/d/up"); err != nil {
 				t.Fatal(err)
 			}
-			if err := b.RemoveAll("/a"); err != nil {
-				t.Fatal(err)
+			for _, dir := range []string{"/a", "/d"} {
+				if err := b.RemoveAll(dir); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if after := e.outsideSnapshot(t); after != before {
 				t.Errorf("outside of root changed:\nbefore\n%s\nafter\n%s", before, after)
@@ -1201,11 +1204,9 @@ func TestSymlinkHostFollow(t *testing.T) {
 		probe   string
 		posixly bool // relies on ".." after a symlink resolving physically
 	}{
-		// A relative link is stored verbatim, so moving it, or a directory
-		// holding it, somewhere shallower makes its ".." climb further.
-		{"rename link shallower", []step{
-			{"mkdir", "/a", ""}, {"symlink", "../secret", "/a/l"}, {"rename", "/a/l", "/l"},
-		}, "/l", false},
+		// A relative link is stored verbatim, so moving a directory holding
+		// it somewhere shallower makes its ".." climb further. (Rename
+		// refuses to move the link itself there; see TestRenameLink.)
 		{"rename dir holding link", []step{
 			{"mkdir", "/a/b", ""}, {"symlink", "../../secret", "/a/b/l"}, {"rename", "/a/b", "/b"},
 		}, "/b/l", false},
@@ -1305,5 +1306,168 @@ func TestSymlinkHostFollow(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRenameLink checks that Rename re-checks a relative symlink's target
+// from the link's new directory, as Symlink does at creation, confined or
+// not, and through a FileSystem as well as a SymlinkFileSystem. It does not
+// look inside a directory it moves.
+func TestRenameLink(t *testing.T) {
+	// Each variant makes a fresh env, a basefs s that makes and reads
+	// links, and r, the basefs that renames them.
+	type variant func(t *testing.T) (e *env, s *basefs.SymlinkFileSystem, r absfs.FileSystem)
+	same := func(newEnv func(*testing.T) *env) variant {
+		return func(t *testing.T) (*env, *basefs.SymlinkFileSystem, absfs.FileSystem) {
+			e := newEnv(t)
+			s := e.symlinkFS(t)
+			return e, s, s
+		}
+	}
+	plain := func(newEnv func(*testing.T) *env) variant {
+		return func(t *testing.T) (*env, *basefs.SymlinkFileSystem, absfs.FileSystem) {
+			e := newEnv(t)
+			return e, e.symlinkFS(t), e.plainFS(t)
+		}
+	}
+	variants := map[string]variant{
+		"osfs":             same(osEnv),
+		"osfs/FileSystem":  plain(osEnv),
+		"memfs":            same(memEnv),
+		"memfs/FileSystem": plain(memEnv),
+		"osfs/unconfined": func(t *testing.T) (*env, *basefs.SymlinkFileSystem, absfs.FileSystem) {
+			e := osEnv(t)
+			s, err := basefs.NewFSUnconfined(e.under, e.root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if basefs.Confined(s) {
+				t.Fatal("NewFSUnconfined is Confined")
+			}
+			return e, s, s
+		},
+	}
+
+	for name, newVariant := range variants {
+		t.Run(name, func(t *testing.T) {
+			e, s, r := newVariant(t)
+			for _, d := range []string{"/a/b/c", "/a/c"} {
+				if err := s.MkdirAll(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.Symlink("../../x", "/a/b/e"); err != nil {
+				t.Fatal(err)
+			}
+			before := e.outsideSnapshot(t)
+
+			// Moved shallower, the target would climb above the root.
+			for _, to := range []string{"/d", "/a/d", "d"} {
+				err := r.Rename("/a/b/e", to)
+				var le *os.LinkError
+				if !errors.Is(err, basefs.ErrPathEscapes) || !errors.As(err, &le) ||
+					le.Op != "rename" || le.Old != "/a/b/e" || le.New != to {
+					t.Errorf("Rename(/a/b/e, %q) = %v, want LinkError wrapping ErrPathEscapes", to, err)
+				}
+				if _, err := s.Lstat(to); !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("Rename(/a/b/e, %q) made %q: %v", to, to, err)
+				}
+			}
+			if info, err := s.Lstat("/a/b/e"); err != nil || info.Mode()&fs.ModeSymlink == 0 {
+				t.Errorf("Lstat(/a/b/e) = %v, %v; want the link left in place", info, err)
+			}
+			if got, err := s.Readlink("/a/b/e"); err != nil || got != "../../x" {
+				t.Errorf("Readlink(/a/b/e) = %q, %v", got, err)
+			}
+
+			// Deeper, sideways and back, the target stays inside.
+			for _, m := range [][2]string{
+				{"/a/b/e", "/a/b/c/e"}, {"/a/b/c/e", "/a/b/e"}, {"/a/b/e", "/a/c/e"},
+			} {
+				if err := r.Rename(m[0], m[1]); err != nil {
+					t.Errorf("Rename(%q, %q) = %v", m[0], m[1], err)
+				}
+			}
+			if got, err := s.Readlink("/a/c/e"); err != nil || got != "../../x" {
+				t.Errorf("Readlink(/a/c/e) = %q, %v", got, err)
+			}
+
+			// An absolute target is stored under the root and moves freely.
+			if err := s.Symlink("/inside.txt", "/a/b/abs"); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Rename("/a/b/abs", "/abs"); err != nil {
+				t.Errorf("Rename(/a/b/abs, /abs) = %v", err)
+			}
+			if got, err := s.Readlink("/abs"); err != nil || got != "/inside.txt" {
+				t.Errorf("Readlink(/abs) = %q, %v", got, err)
+			}
+			if data, err := s.ReadFile("/abs"); err != nil || string(data) != "inside" {
+				t.Errorf("ReadFile(/abs) = %q, %v", data, err)
+			}
+
+			// A directory is moved without looking inside it: the link it
+			// carries now climbs above the root. Confined, the host refuses
+			// to follow it; unconfined, it would follow it out.
+			if err := r.Rename("/a/c", "/c"); err != nil {
+				t.Errorf("Rename(/a/c, /c) = %v", err)
+			}
+			if got, err := s.Readlink("/c/e"); err != nil || got != "../../x" {
+				t.Errorf("Readlink(/c/e) = %q, %v", got, err)
+			}
+			if _, err := s.Stat("/c/e"); basefs.Confined(s) && !errors.Is(err, basefs.ErrPathEscapes) {
+				t.Errorf("confined Stat(/c/e) = %v, want ErrPathEscapes", err)
+			}
+			if after := e.outsideSnapshot(t); after != before {
+				t.Errorf("outside the root changed:\n%s\nwant:\n%s", after, before)
+			}
+		})
+	}
+}
+
+// noLinks hides the underlying filesystem's Lstat and Readlink.
+type noLinks struct{ absfs.FileSystem }
+
+// badReadlink fails every Readlink.
+type badReadlink struct{ absfs.SymlinkFileSystem }
+
+var errReadlink = errors.New("readlink failed")
+
+func (badReadlink) Readlink(string) (string, error) { return "", errReadlink }
+
+// TestRenameLinkUnreadable covers underlying filesystems that cannot report a
+// link's target. With no Lstat or Readlink there is nothing to check, and
+// Rename moves the link. A Readlink that fails refuses the Rename.
+func TestRenameLinkUnreadable(t *testing.T) {
+	e := memEnv(t)
+	if err := e.under.MkdirAll(e.join(e.root, "a", "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.under.Symlink("../../x", e.join(e.root, "a", "b", "e")); err != nil {
+		t.Fatal(err)
+	}
+
+	bad, err := basefs.NewFS(badReadlink{e.under}, e.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = bad.Rename("/a/b/e", "/a/b/f")
+	var le *os.LinkError
+	if !errors.Is(err, errReadlink) || !errors.As(err, &le) || le.Op != "rename" || le.Old != "/a/b/e" || le.New != "/a/b/f" {
+		t.Errorf("Rename with a failing Readlink = %v, want a LinkError wrapping it", err)
+	}
+	if _, err := bad.Lstat("/a/b/e"); err != nil {
+		t.Errorf("Lstat(/a/b/e) = %v; want the link left in place", err)
+	}
+
+	plain, err := basefs.NewFileSystem(noLinks{e.under}, e.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.Rename("/a/b/e", "/d"); err != nil {
+		t.Errorf("Rename without Lstat = %v", err)
+	}
+	if _, err := e.under.Lstat(e.join(e.root, "d")); err != nil {
+		t.Errorf("Lstat(/d) = %v", err)
 	}
 }

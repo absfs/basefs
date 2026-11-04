@@ -279,3 +279,58 @@ func TestSymlinkWindowsRules(t *testing.T) {
 		}
 	}
 }
+
+// renameFS is a linkFS on which every name is a symlink to target, and
+// which records Rename calls.
+type renameFS struct {
+	linkFS
+	renamed bool
+}
+
+// linkInfo describes a symlink; only Mode is called.
+type linkInfo struct{ os.FileInfo }
+
+func (linkInfo) Mode() os.FileMode { return os.ModeSymlink }
+
+func (r *renameFS) Lstat(string) (os.FileInfo, error) { return linkInfo{}, nil }
+
+func (r *renameFS) Rename(string, string) error {
+	r.renamed = true
+	return nil
+}
+
+func TestRenameLinkWindowsRules(t *testing.T) {
+	withWindowsPaths(t, true)
+	rfs := &renameFS{}
+	b := &baseFS{cwd: "/", prefix: `C:\root`, fs: rfs}
+	cases := []struct {
+		target, newname string
+		escapes         bool
+	}{
+		{`..\..\x`, `\a\b\l`, false},
+		{`..\..\x`, `a\l`, true},
+		{`..\..\x`, `\l`, true},
+		// Absolute targets, with or without a volume, are stored under the
+		// root and are not checked.
+		{`C:\root\x`, `\l`, false},
+		{`c:x`, `\l`, false},
+		{`\\srv\share`, `\l`, false},
+		{`\x`, `\l`, false},
+		// As in Symlink, a relative target must also name an ordinary file.
+		{`d\NUL`, `\l`, true},
+	}
+	for _, c := range cases {
+		rfs.target, rfs.renamed = c.target, false
+		err := b.Rename(`\a\b\l`, c.newname)
+		if c.escapes {
+			var le *os.LinkError
+			if !errors.Is(err, ErrPathEscapes) || !errors.As(err, &le) || le.Op != "rename" || rfs.renamed {
+				t.Errorf("Rename of a link to %q to %q = %v (renamed %v), want ErrPathEscapes", c.target, c.newname, err, rfs.renamed)
+			}
+			continue
+		}
+		if err != nil || !rfs.renamed {
+			t.Errorf("Rename of a link to %q to %q = %v (renamed %v)", c.target, c.newname, err, rfs.renamed)
+		}
+	}
+}

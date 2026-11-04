@@ -26,13 +26,16 @@
 // root's host path followed by the target, so Readlink returns exactly the
 // text given to Symlink, as POSIX tools expect. It refuses a target that,
 // resolved lexically from the link's directory, would climb above the root,
-// and an absolute target that is not clean ("/a/../b"). That check is made
-// on names, once, at creation. basefs alone cannot stop the host from
-// following a link physically, so a link that was inside the root when made
-// can lead out of it when the host follows it later:
+// and an absolute target that is not clean ("/a/../b"). Rename makes the
+// same check on a relative link it moves, from the link's new directory, and
+// refuses a move that would take the target above the root. Those checks are
+// made on names, when a link is created or moved. basefs alone cannot stop
+// the host from following a link physically, so a link that was inside the
+// root when made can lead out of it when the host follows it later:
 //
-//   - a relative link such as "../f", moved by Rename (or carried by a Rename
-//     of a directory holding it) somewhere shallower, now climbs further;
+//   - a relative link such as "../f", carried by a Rename of a directory
+//     holding it somewhere shallower, now climbs further (Rename does not
+//     look inside the directories it moves);
 //   - a relative target such as "l/../f", where l is itself a symlink, is
 //     resolved by the host through wherever l points, not lexically;
 //   - a link created beneath a symlinked directory is resolved by the host
@@ -457,16 +460,71 @@ func (b *baseFS) removeChildren() error {
 }
 
 // Rename renames (moves) oldname to newname. Both must lie inside the root.
+//
+// When oldname is itself a symbolic link with a relative target, Rename
+// resolves that target lexically against the directory of newname, as
+// Symlink does at creation, and refuses the move with an *os.LinkError
+// wrapping ErrPathEscapes if the target would then climb above the root:
+// Symlink("../../x", "/a/b/e") is accepted, but Rename("/a/b/e", "/d") is
+// not, and the link stays where it was. An absolute target is stored under
+// the root and stays inside wherever the link moves, so it is not checked.
+// The check is made whether or not the basefs is Confined. An underlying
+// filesystem with no Lstat and Readlink cannot report links, so a
+// FileSystem over it has nothing to check.
+//
+// Rename does not look inside a directory it moves: a relative link carried
+// by a Rename of a directory holding it can climb above the root from its
+// new place. Checking every link in the subtree would cost time in
+// proportion to its size and would race with changes made meanwhile. When
+// the basefs is Confined, the host refuses to follow such a link out of the
+// root; otherwise the host follows it wherever it leads. See the package
+// documentation.
 func (b *baseFS) Rename(oldname, newname string) error {
 	_, oldpath, err := b.path("rename", oldname)
 	if err == nil {
-		var newpath string
-		_, newpath, err = b.path("rename", newname)
+		var vnew, newpath string
+		vnew, newpath, err = b.path("rename", newname)
+		if err == nil {
+			err = b.checkMovedLink(oldpath, vnew)
+		}
 		if err == nil {
 			err = b.fs.Rename(oldpath, newpath)
 		}
 	}
 	return b.fixLinkErr("rename", oldname, newname, err)
+}
+
+// linkReader is the part of absfs.SymLinker that checkMovedLink needs.
+type linkReader interface {
+	Lstat(name string) (os.FileInfo, error)
+	Readlink(name string) (string, error)
+}
+
+// checkMovedLink returns ErrPathEscapes if hpath is a symbolic link with a
+// relative target that, resolved lexically from the directory of the
+// virtual path vdst, would climb above the root. If hpath cannot be
+// examined, it returns nil and leaves Rename to report the error.
+func (b *baseFS) checkMovedLink(hpath, vdst string) error {
+	lr, ok := b.fs.(linkReader)
+	if !ok {
+		return nil
+	}
+	info, err := lr.Lstat(hpath)
+	if err != nil || info.Mode()&fs.ModeSymlink == 0 {
+		return nil
+	}
+	target, err := lr.Readlink(hpath)
+	if err != nil {
+		return err
+	}
+	target = toSlash(target)
+	if path.IsAbs(target) || (windowsPaths && hasVolume(target)) {
+		return nil
+	}
+	if _, ok := cleanVirtual(path.Dir(vdst) + "/" + target); !ok {
+		return ErrPathEscapes
+	}
+	return nil
 }
 
 // Stat returns the FileInfo structure describing file. If there is an error,
@@ -710,12 +768,12 @@ func verbatimRel(root, host string) (string, bool) {
 // because Windows stores absolute targets cleaned, so they could not read
 // back as written. On Windows, an oldname carrying a volume is refused too.
 //
-// That check concerns names, at creation time. The host follows a stored
-// link physically, so unless the basefs is Confined, a link that named a
-// place inside the root when it was made can resolve outside it later: a
-// relative link moved by Rename (or inside a directory moved by Rename)
-// somewhere shallower, or a relative target whose ".." follows an element
-// that is itself a symlink. See the package documentation.
+// That check concerns names, at creation time; Rename repeats it for a link
+// it moves. The host follows a stored link physically, so unless the basefs
+// is Confined, a link that named a place inside the root when it was made
+// can resolve outside it later: a relative link inside a directory moved by
+// Rename somewhere shallower, or a relative target whose ".." follows an
+// element that is itself a symlink. See the package documentation.
 func (f *SymlinkFileSystem) Symlink(oldname, newname string) error {
 	vlink, hlink, err := f.path("symlink", newname)
 	if err != nil {
